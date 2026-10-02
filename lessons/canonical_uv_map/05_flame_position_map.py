@@ -9,17 +9,22 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+# just loading
 root = Path(__file__).resolve().parents[2]
 input_path = root / 'outputs/canonical_uv_map/04/flame_data.npz'
 if not input_path.exists():
     raise FileNotFoundError('먼저 04_read_flame.py를 실행하세요.')
 with np.load(input_path) as data:
     vertices, faces, uv, uv_faces = [data[key] for key in ('vertices', 'faces', 'uv', 'uv_faces')]
-height = width = 128  # 64부터 관찰해도 좋다. 올리면 CPU 반복문이 더 오래 걸린다.
+
+# resolution parameter
+height = width = 512  # 64부터 관찰해도 좋다. 올리면 CPU 반복문이 더 오래 걸린다.
 face_index = np.full((height, width), -1, dtype=int)
 barycentric = np.zeros((height, width, 3))
 position = np.zeros((height, width, 3))
 uv_grid = np.zeros((height, width, 2))
+
+
 for row in range(height):
     for col in range(width):
         uv_grid[row, col] = [(col + .5) / width, 1 - (row + .5) / height]

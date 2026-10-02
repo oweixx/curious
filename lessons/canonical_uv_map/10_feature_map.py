@@ -30,11 +30,11 @@ normalized_position = (position - center) / scale
 inputs_hwc = np.concatenate([normalized_position, normal, texture], axis=-1)
 inputs_hwc[~mask] = 0  # 3+3+3=9채널. 빈 영역에는 관측값이 없다.
 
-device = 'cpu'
+device = 'cuda:0'
 # GPU 2에서 관찰하려면 위 값을 'cuda:0'으로 바꾸고 아래 명령으로 실행한다:
 # CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2 python lessons/canonical_uv_map/10_feature_map.py
 feature_channels = 8
-TRAIN_STEPS = 0  # 먼저 0에서 이해한 뒤, 선택적으로 100을 시도한다.
+TRAIN_STEPS = 1000  # 먼저 0에서 이해한 뒤, 선택적으로 100을 시도한다.
 torch.manual_seed(7)
 inputs = torch.tensor(inputs_hwc, dtype=torch.float32).permute(2, 0, 1)[None].to(device)
 mask_tensor = torch.tensor(mask, dtype=torch.float32)[None, None].to(device)
@@ -69,6 +69,8 @@ features_hwc = features[0].permute(1, 2, 0).cpu().numpy()
 print('Feature shape:', features_hwc.shape, '입력 복원 MSE:', final_loss)
 print('학습 여부:', TRAIN_STEPS > 0, '복원 학습은 identity/semantic supervision과 다르다.')
 
+
+# Visualization
 # 첫 3채널의 min/max를 RGB로 표시한다. 채널 번호에 코/눈 같은 의미가 붙는 건 아니다.
 display = features_hwc[..., :3].copy()
 low, high = display[mask].min(0), display[mask].max(0)

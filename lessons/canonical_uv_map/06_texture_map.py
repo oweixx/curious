@@ -9,6 +9,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from PIL import Image
 
+# just reading
 root = Path(__file__).resolve().parents[2]
 lookup_path = root / 'outputs/canonical_uv_map/05/lookup.npz'
 if not lookup_path.exists():

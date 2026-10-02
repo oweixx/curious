@@ -23,7 +23,7 @@ if abs(determinant) < 1e-12:
     raise ValueError('UV 삼각형이 선/점으로 납작해졌다.')
 
 # 2. 처음에는 8x8로 작게 만든다. 3은 RGB가 아니라 X/Y/Z 채널의 수다.
-height, width = 8, 8
+height, width = 32, 32
 position_map = np.zeros((height, width, 3))
 valid_mask = np.zeros((height, width), dtype=bool)
 uv_grid = np.zeros((height, width, 2))

@@ -23,7 +23,7 @@ vertex_normals = np.load(normal_path)
 
 # XY 위치에 따라 작은 bump를 만든다. 이 bump는 머리의 앞/뒤 양쪽에 생길 수 있다.
 # 같은 geometry vertex의 UV seam 양쪽에는 동일한 변위가 적용된다.
-amplitude = .002  # 모델 단위. 모델이 m 단위일 때 2 mm다.
+amplitude = .005  # 모델 단위. 모델이 m 단위일 때 2 mm다.
 center = (vertices.min(0) + vertices.max(0)) / 2
 extent = np.maximum(np.ptp(vertices, axis=0), 1e-6)
 xy = (vertices[:, :2] - center[:2]) / extent[:2]

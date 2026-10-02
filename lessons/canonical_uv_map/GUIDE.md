@@ -17,7 +17,7 @@
 | 06 | [06_texture_map.py](06_texture_map.py) | 같은 주소에 위치 대신 색을 담으면 어떻게 쓰이는가? | 체크무늬 Texture Map과 색칠된 3D 점 |
 | 07 | [07_normal_map.py](07_normal_map.py) | 표면 방향은 어디에서 계산하고 어떻게 UV로 옮기는가? | Object-space Normal Map과 vertex normals |
 | 08 | [08_displacement_map.py](08_displacement_map.py) | 기준 표면을 조금 움직이면 어떤 배열이 변하는가? | Displacement, 변위 적용 Position과 Normal, P=P_base+D 확인 |
-| 09 | [09_canonical_and_expression.py](09_canonical_and_expression.py) | Canonical 기준과 표정/회전 상태는 UV에서 어떻게 연결되는가? | 같은 주소의 canonical/expression/rotation Position 비교 |
+| 09 | [09_canonical_and_expression.py](09_canonical_and_expression.py) | Canonical 기준과 표정/회전 상태는 UV에서 어떻게 연결되는가? | 3D 비교, UV XYZ 채널 비교, 축별 변화와 변위 크기 |
 | 10 | [10_feature_map.py](10_feature_map.py) | 픽셀에 C개 특징을 담는다는 것은 무엇인가? | 8채널 Feature Map, network weights, 선택적 복원 학습 |
 | 11 | [11_collect_five_maps.py](11_collect_five_maps.py) | 다섯 종류의 정보를 같은 표면에 어떻게 연결하는가? | Five-map NPZ, 비교 그림, OBJ point cloud, 회전 가능한 HTML |
 | 12 | [12_seams_and_sampling.py](12_seams_and_sampling.py) | UV 표현은 어떤 이웃관계와 면적 정보를 왜곡하는가? | Seam의 여러 주소, 면적별 밀도, 64/128 sampling 비교 |
