@@ -1,0 +1,35 @@
+# 로컬 Python 환경: 실행/변환 환경은 setup script로 재생성한다.
+/.venv*/
+/venv/
+
+# Python 캐시와 검사/빌드 결과
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+/build/
+/dist/
+.ipynb_checkpoints/
+
+# FLAME 원본·변환 모델·다운로드 asset과 실행 출력
+/FLAME2023/
+/outputs/
+/assets/flame/*
+!/assets/flame/README.md
+
+# 로컬 설정/비밀 값과 OS 임시 파일
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# uv.lock, 학습용 notebook, docs의 이미지/시각화는 Git에 포함한다.
