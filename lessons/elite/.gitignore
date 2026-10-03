@@ -1,0 +1,12 @@
+# Lesson 코드, GUIDE, 환경 명세를 Git에 올린다. 영상, tracking, 가중치, 실행 출력은 로컬 자료다.
+/data/
+/outputs/
+/checkpoints/
+/external/
+/.cache/
+# 영상을 lesson 폴더에 바로 넣더라도 Git에 올리지 않는다.
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm

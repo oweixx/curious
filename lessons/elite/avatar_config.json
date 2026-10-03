@@ -1,0 +1,41 @@
+{
+  "format": "elite_single_identity_scratch_v1",
+  "seed": 42,
+  "uv_size": 512,
+  "image_max_side": 1024,
+  "network": {
+    "embedding": 128,
+    "model_channels": 32,
+    "channel_mult": [1, 2, 2, 2, 2, 2],
+    "num_blocks": 1,
+    "attention_sizes": [16]
+  },
+  "training": {
+    "steps": 30000,
+    "batch_size": 1,
+    "lr": 0.0005,
+    "weight_decay": 0.02,
+    "warmup_steps": 500,
+    "grad_clip": 0.5,
+    "log_every": 50,
+    "validate_every": 1000,
+    "checkpoint_every": 1000,
+    "validation_frames": 16,
+    "background": "white"
+  },
+  "loss": {
+    "photo": 10.0,
+    "alpha": 2.0,
+    "ssim": 2.0,
+    "lpips": 0.2,
+    "normal": 0.5,
+    "distortion": 100.0,
+    "tv_color": 0.000005,
+    "tv_displacement": 0.00001,
+    "displacement_l2": 0.001,
+    "uv_color": 0.02,
+    "geometry_start": 1000,
+    "geometry_ramp": 2000,
+    "lpips_max_side": 512
+  }
+}

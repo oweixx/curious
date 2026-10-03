@@ -5,6 +5,10 @@
   - 3D Head, Face Avatar에서 Canonical UV Map을 이용하여 Geometry를 표현하는 논문들을 많이 볼 수 있다. 대부분 3D -> 2D로 표현하면서 가져가는 Network의 이점들을 가져가는듯 하기도 하다.
   - [RealDenseFace (CVPRW 2026)](https://arxiv.org/abs/2606.24144)
   - [FiCA (Preprint)](https://arxiv.org/pdf/2606.24232)
+- ELITE (26/10/03)
+  - I want to implement from scratch. First, extract FLAME meshe from a monocular video in NeRSemble dataset. Second, We make Canonical geometry/texture uv map to aligned with previous extracted FLAME mesh. And then, we predict/bind on Gaussian Parameter map. So we can render using naive 2DGS.
+  - [ELITE (CVPR 2026)](https://arxiv.org/abs/2601.10200)
+  
 
 ---
 ### TODO
@@ -29,7 +33,7 @@
     - [ShapeUP (SIGGRAPH 2026)](https://inbar-2344.github.io/ShapeUp-page/)
     - [Prox-E (SIGGRAPH 2026)](https://etaisella.github.io/Prox-E/)
   
-- ?
+- Not specified.
   - Idea
   - References
     - [ELITE (CVPR 2026)](https://arxiv.org/abs/2601.10200)
