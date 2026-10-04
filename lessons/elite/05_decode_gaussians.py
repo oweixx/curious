@@ -8,6 +8,7 @@ R_world = R_TBN @ R_local; CUDA renderer의 quaternion 순서는 wxyz다.
 
 CUDA_VISIBLE_DEVICES=2 python 05_decode_gaussians.py --frame 0
 이 lesson의 render는 network 학습 전의 실제 초기화 상태이며 학습 결과가 아니다.
+결과에 raw 16채널 Map, decoded UV Map 시각화와 실제 수치 tensor도 저장한다.
 """
 
 import argparse
@@ -99,7 +100,11 @@ class SurfaceMap:
         return points, rotations
 
     def decode(self, geometry_map, appearance_map, points, rotations):
-        """Network에서 CUDA splatting까지 gradient가 이어진다. invalid UV는 제거한다."""
+        """UV parameter Map을 Gaussian으로 변환하는 고정된 미분 가능 계산이다.
+
+        여기에는 학습할 weight가 없다. 08에서는 network가 만든 Map이 입력되고,
+        render loss의 gradient가 이 계산을 통과해 network까지 돌아간다.
+        """
         import torch
         import torch.nn.functional as F
         b, c, h, w = geometry_map.shape
@@ -189,6 +194,102 @@ def render(gaussians, index, K, w2c, h, w, background):
             "surface_normal":depth_normal(median,K,w2c),"radii":radii,"screen":screen}
 
 
+def save_gaussian_maps(out, frame_id, surface, decoded):
+    """Raw Map과 실제 Gaussian 파라미터를 UV 격자에서 보여준다.
+
+    Raw는 activation 전 값이다. 예: opacity raw=0 -> sigmoid -> opacity=0.5.
+    Decode가 추린 Gaussian list를 원래 texel 주소에 다시 배치한다.
+    표시용 정규화는 PNG에만 적용하고 실제 수치는 .pt에 저장한다.
+    """
+    import numpy as np
+    import torch
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    size = surface.uv["uv_size"]
+    valid = surface.lookup["valid"].detach().cpu()
+    indices = surface.indices.detach().cpu()
+
+    def to_uv(values):
+        # [N,C] -> [C,H,W]. Invalid 값은 0이며 valid mask와 함께 해석한다.
+        values = values.detach().cpu()
+        grid = values.new_zeros(size*size, values.shape[-1])
+        grid[indices] = values
+        return grid.reshape(size, size, -1).permute(2, 0, 1).contiguous()
+
+    geometry = decoded["geometry_map"][0].detach().cpu()
+    appearance = decoded["appearance_map"][0].detach().cpu()
+    raw = torch.cat((geometry, appearance), dim=0)
+    names = ["coarse T raw", "coarse B raw", "coarse N raw",
+             "scale axis 1 raw", "scale axis 2 raw",
+             "local quaternion x residual", "local quaternion y residual",
+             "local quaternion z residual", "local quaternion w residual",
+             "fine T raw", "fine B raw", "fine N raw", "opacity logit",
+             "appearance R residual", "appearance G residual", "appearance B residual"]
+    maps = {key:to_uv(decoded[key][0]) for key in
+            ("base", "position", "coarse", "fine", "displacement", "scale", "opacity", "color")}
+    # 저장한 world quaternion은 wxyz다. 기존 matrix 함수에는 xyzw로 바꿔 전달한다.
+    world_q = decoded["rotation"][0].detach().cpu()
+    maps["normal"] = to_uv(quaternion_matrix(world_q[:, [1, 2, 3, 0]])[:, :, 2])
+    xyz_min = decoded["position"][0].detach().cpu().amin(dim=0)
+    xyz_max = decoded["position"][0].detach().cpu().amax(dim=0)
+    L03.save_tensor(out/f"{frame_id:06d}_initial_uv_maps.pt", {
+        "geometry_map":geometry, "appearance_map":appearance,
+        "channel_names":names, "valid":valid, "decoded":maps,
+        "xyz_display_min":xyz_min, "xyz_display_max":xyz_max,
+        "convention":"row=0 -> v=1; local displacement axes are T,B,N; decoded scale is in FLAME world units",
+    })
+
+    # 16개의 raw 채널을 따로 표시한다. 표시 색은 값의 크기를 나타낸다.
+    figure = Figure(figsize=(15, 13), constrained_layout=True)
+    FigureCanvasAgg(figure)
+    axes = figure.subplots(4, 4).reshape(-1)
+    invalid = ~valid.numpy()
+    for i, axis in enumerate(axes):
+        selected = raw[i][valid]
+        limit = max(1., float(selected.abs().max()))
+        image = axis.imshow(np.ma.array(raw[i].numpy(), mask=invalid),
+                            cmap="coolwarm", vmin=-limit, vmax=limit, origin="upper")
+        axis.set_facecolor("#202020")
+        axis.set_title(f"{i:02d}: {names[i]}\nmin={float(selected.min()):.4g}, max={float(selected.max()):.4g}", fontsize=9)
+        axis.set_axis_off()
+        figure.colorbar(image, ax=axis, shrink=.65)
+    figure.suptitle("Initial Gaussian UV Map: raw 13 geometry + 3 appearance channels")
+    figure.savefig(out/f"{frame_id:06d}_initial_uv_raw_channels.png", dpi=120)
+
+    def rgb_display(value):
+        # 아래 변환은 표시용이다. maps에 저장된 실제 값은 바꾸지 않는다.
+        return (value.clamp(0, 1)*valid[None]).permute(1, 2, 0).numpy()
+
+    scale_max = .1*math.exp(-3.5)
+    xyz_display = (maps["position"]-xyz_min[:, None, None])/(xyz_max-xyz_min).clamp_min(1e-8)[:, None, None]
+    panels = [
+        ("Gaussian RGB", rgb_display(maps["color"]), None, 0, 1),
+        ("World XYZ (display normalized)", rgb_display(xyz_display), None, 0, 1),
+        ("Local displacement T/B/N (0 = gray; +/-0.3)", rgb_display(maps["displacement"]/.6+.5), None, 0, 1),
+        ("World Gaussian normal XYZ (-1..1)", rgb_display(maps["normal"]*.5+.5), None, 0, 1),
+        ("Scale axis 1 (FLAME world units)", maps["scale"][0].numpy(), "viridis", 0, scale_max),
+        ("Scale axis 2 (FLAME world units)", maps["scale"][1].numpy(), "viridis", 0, scale_max),
+        ("Opacity (0..1)", maps["opacity"][0].numpy(), "gray", 0, 1),
+        ("Valid UV texels", valid.numpy(), "gray", 0, 1),
+    ]
+    figure = Figure(figsize=(16, 8), constrained_layout=True)
+    FigureCanvasAgg(figure)
+    axes = figure.subplots(2, 4).reshape(-1)
+    for axis, (title, value, cmap, low, high) in zip(axes, panels):
+        if cmap is None:
+            axis.imshow(value, origin="upper")
+        else:
+            mask = np.zeros_like(invalid) if title == "Valid UV texels" else invalid
+            image = axis.imshow(np.ma.array(value, mask=mask), cmap=cmap, vmin=low, vmax=high, origin="upper")
+            figure.colorbar(image, ax=axis, shrink=.7)
+        axis.set_facecolor("#202020")
+        axis.set_title(title, fontsize=10)
+        axis.set_axis_off()
+    figure.suptitle("Decoded Gaussian UV Maps: initialization, before training")
+    figure.savefig(out/f"{frame_id:06d}_initial_uv_decoded.png", dpi=120)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
     L03.add_arguments(parser)
@@ -216,6 +317,7 @@ def main():
     L03.save_image(out/f"{args.frame:06d}_initial_alpha.png",image["alpha"])
     L03.save_image(out/f"{args.frame:06d}_initial_normal.png",image["normal"]*.5+.5)
     L03.save_tensor(out/f"{args.frame:06d}_initial_gaussians.pt",{k:decoded[k].cpu() for k in ("position","rotation","scale","color","opacity")})
+    save_gaussian_maps(out, args.frame, surface, decoded)
     if args.check_backward:
         dataset=L03.lesson(7).VideoFrames(scene,max_side=max(h,w))
         target=dataset.batch([args.frame],args.device)

@@ -674,6 +674,20 @@ UV resolution에 맞춰 초기화한다. Local quaternion은 xyzw, renderer 입�
 Invalid UV pixel은 아예 Gaussian list에서 제외한다. 실제 backend가 RGB, alpha, normal,
 median/expected depth, distortion을 계산한다.
 
+05를 실행하면 `outputs/05/<sequence>/<run>/`에 Gaussian Map도 저장한다.
+`000000_initial_uv_raw_channels.png`는 activation 전 geometry 13채널과 appearance 3채널을
+따로 보여준다. `000000_initial_uv_decoded.png`는 실제 Gaussian RGB, world XYZ, 로컬 변위,
+world normal, 두 축 scale, opacity, valid mask를 UV 격자에서 보여준다. Frame을 바꾸면
+파일 이름의 숫자도 바뀐다. XYZ/변위/normal의 RGB는 좌표 시각화이며 실제 texture 색이 아니다.
+초기 변위는 0이라 회색이고 scale은 일정하며 opacity는 0.5다. Raw opacity 값 0과
+실제 opacity 0.5는 서로 다른 단계의 값이다. `000000_initial_uv_maps.pt`에는 raw Map,
+decoded Map의 실제 수치, valid mask와 XYZ 표시용 정규화 범위를 저장한다.
+
+`decode`에는 학습할 weight가 없다. Geometry/appearance Map을 입력받아 activation,
+유효 texel 선택, 표면 위치와 TBN 변환을 수행하는 고정된 미분 가능 함수다. 05에서는
+Map을 수동 초기화하고, 08에서는 network가 Map을 출력한다. Renderer의 loss gradient가
+`decode`를 통과해 network로 전달되어 network weight가 학습된다.
+
 이 단계의 이미지는 **학습 전 초기 상태**다. 개인 shape를 제거한 base 위에 offset=0을
 놓았으므로 완성된 개인 avatar로 해석하지 않는다. `--check-backward`는 실제 frame의
 RGB/alpha loss를 계산하고 geometry/appearance map까지 finite nonzero gradient가 돌아오는지
