@@ -87,6 +87,15 @@ def read_scene(sequence, run):
     return s
 
 
+def save_image(path, tensor):
+    """[C,H,W] float [0,1] -> PNG/JPEG. 시각화 값만 clip한다."""
+    import numpy as np
+    from PIL import Image
+    path.parent.mkdir(parents=True, exist_ok=True)
+    array = (tensor.detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy()*255).round().astype(np.uint8)
+    Image.fromarray(array[..., 0] if array.shape[-1] == 1 else array).save(path)
+
+
 def split_frames(count, block=40, fraction=.2, gap=2):
     """연속 block 끝의 frame을 validation에 두고 그 경계의 train frame을 제외한다.
 
@@ -192,15 +201,6 @@ def head_keep_mask(vertices, model, K, w2c, height, width):
     mask = (row < slope*col + intercept).float()[None]
     kernel = max(3, int(.03*width)//2*2+1)
     return TF.gaussian_blur(mask, [kernel, kernel], [float(kernel), float(kernel)]).clamp(0, 1)
-
-
-def save_image(path, tensor):
-    """[C,H,W] float [0,1] -> PNG/JPEG. 시각화 값만 clip한다."""
-    import numpy as np
-    from PIL import Image
-    path.parent.mkdir(parents=True, exist_ok=True)
-    array = (tensor.detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy()*255).round().astype(np.uint8)
-    Image.fromarray(array[..., 0] if array.shape[-1] == 1 else array).save(path)
 
 
 def main():

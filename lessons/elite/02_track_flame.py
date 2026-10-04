@@ -188,6 +188,18 @@ def check_runtime():
     print(f"Python {sys.version.split()[0]} | NumPy {np.__version__}")
     print(f"Torch {torch.__version__} / CUDA {torch.version.cuda} | torchvision {torchvision.__version__}")
     print(f"GPU: {torch.cuda.get_device_name(0)} | visible={os.environ.get('CUDA_VISIBLE_DEVICES')}")
+    # PyTorch wheel의 runtime과 CUDA extension을 빌드하는 toolkit은 별도다.
+    # cpp_extension은 import 시 CUDA_HOME을 찾으므로 shell에서 먼저 설정해야 한다.
+    from torch.utils.cpp_extension import CUDA_HOME
+    nvcc = Path(CUDA_HOME) / "bin" / "nvcc" if CUDA_HOME else None
+    print(f"CUDA toolkit: {CUDA_HOME} | nvcc: {nvcc}")
+    if nvcc is None or not nvcc.is_file():
+        raise RuntimeError(
+            "NVDiffrast JIT build에 필요한 CUDA toolkit/nvcc를 찾지 못했다.\n"
+            f"torch.version.cuda={torch.version.cuda}는 PyTorch runtime의 버전이다.\n"
+            "GUIDE의 'CUDA_HOME 오류' 항목처럼 toolkit을 준비하고, 실제 toolkit root를\n"
+            "shell에서 CUDA_HOME으로 지정한 뒤 새 Python process로 실행하세요."
+        )
     try:
         # 작은 삼각형의 rasterization -> interpolation -> antialias -> backward를 검증한다.
         vertices = torch.tensor([[[-.8, -.8, 0., 1.], [.8, -.8, 0., 1.], [0., .8, 0., 1.]]],
@@ -207,7 +219,7 @@ def check_runtime():
         laplacian = mesh.laplacian_packed().to_dense()
         if not torch.isfinite(laplacian).all():
             raise RuntimeError("PyTorch3D Laplacian 계산 실패.")
-    except RuntimeError as error:
+    except (RuntimeError, OSError) as error:
         raise RuntimeError(
             f"CUDA/compiled extension 확인 실패: {error}\n"
             "GUIDE의 CUDA toolkit / PyTorch3D / nvdiffrast 설치 항목을 확인하세요."

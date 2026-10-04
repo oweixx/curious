@@ -381,6 +381,99 @@ PyTorch3D Laplacian을 실행한다. 이어서 STAR import와 weight 경로를 �
 
 ### 순서대로 실행하고 확인하기
 
+#### CUDA_HOME 오류
+
+`RasterizeCudaContext()`에서 `CUDA_HOME environment variable is not set`이 발생하면
+PyTorch가 NVDiffrast CUDA extension을 빌드할 toolkit root를 찾지 못한 것이다.
+`torch.version.cuda=12.4`는 설치된 PyTorch의 CUDA runtime build를 뜻하며 `nvcc` 설치를
+의미하지 않는다. Matting은 미리 빌드된 PyTorch 연산을 이용하지만 이 NVDiffrast fork는
+처음 context를 만들 때 CUDA/C++ source를 JIT compile한다.
+
+활성 `elite` 환경에서 먼저 확인한다.
+
+```bash
+command -v nvcc
+nvcc --version
+```
+
+CUDA 12.4 toolkit을 이미 설치했다면 그 실제 root를 `CUDA_HOME`으로 지정한다.
+`CUDA_HOME/bin/nvcc`가 존재해야 하며, 존재하지 않는 `/usr/local/cuda-12.4` 경로를 변수에
+넣는 것만으로는 해결되지 않는다. Toolkit이 없다면 현재 Conda 환경에 준비할 수 있다.
+사용자가 실행하는 NVIDIA CUDA 12.4.1 toolkit 설치 예시:
+
+```bash
+conda activate elite
+conda install -n elite -c nvidia/label/cuda-12.4.1 cuda-toolkit=12.4.1
+export CUDA_HOME="$CONDA_PREFIX"
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib:$CUDA_HOME/targets/x86_64-linux/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export TORCH_CUDA_ARCH_LIST=9.0
+export MAX_JOBS=8
+nvcc --version
+```
+
+이 설정은 현재 shell에 적용된다. Agent는 설치나 GPU 실행을 수행하지 않는다.
+`nvcc --version`에 release 12.4가 표시된 뒤 새 Python process로 다시 실행한다.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python lessons/elite/02_track_flame.py --stage check
+```
+
+위 경로는 repo root에서 실행하는 예시다. `lessons/elite` 안에서는 `python 02_track_flame.py`를
+사용한다. 현재 사용자가 선택한 GPU 0을 유지한 예시이며, GPU 2를 쓸 경우 노출 번호를 바꾼다.
+이 오류만으로 PyTorch/NVDiffrast 재설치나 JIT cache 삭제를 할 필요는 없다.
+Toolkit 연결 후 실제 compile에서 별도 오류가 나오면 해당 build log를 기준으로 확인한다.
+
+참고: [PyTorch 2.5.1의 toolkit 경로 탐색](https://github.com/pytorch/pytorch/blob/v2.5.1/torch/utils/cpp_extension.py),
+[NVIDIA Conda toolkit 설치](https://docs.nvidia.com/cuda/archive/12.4.1/cuda-installation-guide-linux/index.html#conda-installation).
+
+#### CUDA 11.8을 선택하는 경우
+
+ELITE 원본은 CUDA 11.8과 gcc/g++ 11에서 검증했다. CUDA 11.8은 Hopper sm_90 native
+kernel을 만들 수 있다. 이번 lesson도 11.8로 구성할 수 있지만 현재 Torch가 `cu124`라면
+toolkit만 교체하지 않는다. Torch runtime과 extension build toolkit을 함께 11.8로 맞춘다.
+PyTorch version은 lesson의 API를 유지하도록 2.5.1을 사용하며 원본 전체 환경과 같다는
+의미는 아니다. 다음은 사용자가 실행하는 절차다.
+
+```bash
+conda activate elite
+conda install -n elite -c nvidia/label/cuda-11.8.0 cuda-toolkit=11.8.0
+python -m pip install --upgrade torch==2.5.1+cu118 torchvision==0.20.1+cu118 --index-url https://download.pytorch.org/whl/cu118
+
+export CUDA_HOME="$CONDA_PREFIX"
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib:$CUDA_HOME/targets/x86_64-linux/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export CC=/usr/bin/gcc-11
+export CXX=/usr/bin/g++-11
+export TORCH_CUDA_ARCH_LIST=9.0
+export MAX_JOBS=8
+nvcc --version
+python -c 'import torch; print(torch.__version__, torch.version.cuda)'
+```
+
+`nvcc`는 release 11.8, Torch는 `2.5.1+cu118` / `11.8`이어야 한다. Local version suffix
+`+cu118`를 명시한 것은 이미 설치된 동일 2.5.1의 `+cu124` build도 확실히 교체하기 위해서다.
+Conda toolkit만 설치하는 과정에서는 PyTorch wheel이 자동으로 교체되지 않는다.
+
+Torch/CUDA를 바꾼 뒤 compiled extension은 현재 조합에 맞춰 다시 빌드한다. 기존 binary가
+pip wheel cache에서 재사용되지 않도록 `--no-cache-dir`를 사용한다. NumPy와 기존 dependency를
+임의로 업그레이드하지 않도록 extension 설치에는 `--no-deps`를 유지한다.
+
+```bash
+MAX_JOBS=8 FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST=9.0 python -m pip install --no-cache-dir --no-build-isolation --no-deps --force-reinstall git+https://github.com/facebookresearch/pytorch3d.git@33824be3cbc87a7dd1db0f6a9a9de9ac81b2d0ba
+MAX_JOBS=8 python -m pip install --no-cache-dir --no-build-isolation --no-deps --force-reinstall git+https://github.com/ShenhanQian/nvdiffrast.git@22718580f24a313c429ba2c304794c264351f108
+CUDA_VISIBLE_DEVICES=0 python lessons/elite/02_track_flame.py --stage check
+```
+
+위 실행 경로는 repo root 기준이다. 2DGS backend도 이미 설치했다면 새 Torch/CUDA 조합으로
+05 dependency를 다시 빌드한다. 원본의 PyTorch 2.0.1용 PyTorch3D wheel을 이번 2.5.1에
+사용하지 않는다. 실제 H200 kernel 실행과 backward는 `--stage check`로 확인한다.
+Agent는 이 환경 교체/설치/build/GPU 실행을 수행하지 않는다.
+
+참고: [ELITE 원본 환경](https://github.com/kaist-ami/ELITE#environment-setup),
+[PyTorch 2.5.1 CUDA 11.8 build](https://pytorch.org/get-started/previous-versions/#v251),
+[NVIDIA Hopper 호환성](https://docs.nvidia.com/cuda/hopper-compatibility-guide/index.html).
+
 **1. 실제 landmark 검출**
 
 ```bash
@@ -537,6 +630,13 @@ CUDA_VISIBLE_DEVICES=2 python 04_build_canonical_uv.py --uv-size 512
 읽을 순서는 `uv_lookup`, `interpolate_vertices`, `face_tbn`, texture fusion loop다.
 UV resolution은 출력 RGB 해상도와 독립적이다. `row=0`은 `v=1`, pixel center는
 `((col+.5)/U, 1-(row+.5)/U)`로 통일한다.
+
+CUDA rasterizer의 coverage 판정은 꼭짓점을 1/16 pixel 격자로 반올림한다. 그래서 경계에서
+선택된 face와 원래 UV triangle의 내부 판정이 조금 다를 수 있다. `uv_lookup`은 float64로
+barycentric을 직접 계산하고, 차이가 subpixel 범위인지 실제 pixel 거리로 검사한다.
+원래 triangle 밖에 있는 center는 `valid=False`, `face=-1`, `bary=0`으로 제외한다.
+얇은 triangle에서는 작은 위치 차이도 큰 음수 가중치가 될 수 있으므로 가중치의 절댓값만으로
+오류를 판정하지 않는다. 제외된 texel 수는 실행 출력과 `summary.json`에서 확인할 수 있다.
 
 `face[U,U]`와 `bary[U,U,3]`가 표면 대응을 정의한다. XYZ는 `sum(w_i * v_i)`로 만들며
 같은 lookup을 frame별 posed mesh에 적용하면 posed XYZ가 된다. `face_tbn`은 UV triangle의

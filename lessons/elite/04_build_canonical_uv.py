@@ -27,9 +27,13 @@ def uv_lookup(vt, ft, size, context):
     clip = torch.cat((vt*2-1, torch.zeros_like(vt[:, :1]), torch.ones_like(vt[:, :1])), -1)
     rast, _ = dr.rasterize(context, clip[None].contiguous(), ft.int().contiguous(), [size, size])
     face = rast[0, ..., 3].long().flip(0) - 1  # 0은 background -> -1
+    covered = face >= 0
+    if not covered.any():
+        raise ValueError("UV rasterization 결과가 비어 있다. UV 범위/triangle winding을 확인하세요.")
     row, col = torch.meshgrid(torch.arange(size, device=vt.device), torch.arange(size, device=vt.device), indexing="ij")
-    query = torch.stack(((col+.5)/size, 1-(row+.5)/size), dim=-1)
-    tri = vt[ft[face.clamp_min(0)]]  # [H,W,3,2]. Background는 아래에서 마스킹한다.
+    # 얇은 UV triangle에서도 가중치를 안정적으로 계산하도록 이 계산만 float64로 한다.
+    query = torch.stack(((col.double()+.5)/size, 1-(row.double()+.5)/size), dim=-1)
+    tri = vt.double()[ft[face.clamp_min(0)]]  # [H,W,3,2]. Background는 아래에서 마스킹한다.
     a, b, c = tri.unbind(-2)
     e0, e1, q = b-a, c-a, query-a
     determinant = e0[..., 0]*e1[..., 1] - e0[..., 1]*e1[..., 0]
@@ -37,15 +41,41 @@ def uv_lookup(vt, ft, size, context):
     wb = (q[..., 0]*e1[..., 1] - q[..., 1]*e1[..., 0])/safe
     wc = (e0[..., 0]*q[..., 1] - e0[..., 1]*q[..., 0])/safe
     bary = torch.stack((1-wb-wc, wb, wc), dim=-1)
-    valid = (face>=0) & (determinant.abs()>1e-12)
-    # UV borders에서 float 오차는 허용하지만 잘못된 face/pixel 대응은 즉시 멈춘다.
-    if not valid.any() or (bary[valid].min() < -2e-4) or (bary[valid].max() > 1.0002):
-        raise ValueError("UV rasterization과 pixel-center barycentric 대응을 확인하세요.")
+    usable = covered & (determinant.abs()>1e-12)
+    if not usable.any() or not torch.isfinite(bary[usable]).all():
+        raise ValueError("퇴화하지 않은 UV triangle의 유한한 barycentric 좌표가 없다.")
+
+    # CUDA rasterizer는 coverage를 판정할 때 vertex를 1/16 pixel 격자에 snap한다.
+    # 따라서 선택된 face의 '원래' 경계 밖에 pixel center가 살짝 있을 수 있다.
+    # barycentric 값의 오차는 triangle 두께에 따라 커지므로 pixel 거리로 검사한다.
+    opposite_edges = torch.stack((c-b, a-c, b-a), dim=-2)
+    edge_lengths = opposite_edges.norm(dim=-1).clamp_min(1e-20)
+    signed_edge_distance_px = bary * determinant.abs()[..., None] / edge_lengths * size
+    tolerance_px = 1/16 + 4*torch.finfo(vt.dtype).eps*size
+    max_outside_px = float((-signed_edge_distance_px[usable].min()).clamp_min(0))
+    if max_outside_px > tolerance_px:
+        raise ValueError(
+            f"UV face/pixel 대응이 {max_outside_px:.6f} pixel 어긋났다 "
+            f"(coverage snap 허용 거리 {tolerance_px:.6f}). "
+            "UV row flip/face index/좌표계를 확인하세요."
+        )
+    # 원래 triangle 밖의 center는 valid에서 제외한다. 음수 가중치로 표면 밖을 보간하지 않는다.
+    boundary_excluded = usable & (bary.min(dim=-1).values < -1e-10)
+    valid = usable & ~boundary_excluded
+    if not valid.any():
+        raise ValueError("원래 UV triangle 내부에 있는 pixel center가 없다.")
+    # 여기서는 float64 산술의 극소 오차만 제거한다. 경계 밖 texel을 강제로 clamp하지 않는다.
+    bary = bary.clamp_min(0)
+    bary = bary / bary.sum(dim=-1, keepdim=True).clamp_min(1e-20)
     reconstructed = (bary[..., None]*tri).sum(-2)
     if (reconstructed[valid]-query[valid]).abs().max() > 1e-5:
         raise ValueError("UV barycentric reconstruction 오류")
     bary = torch.where(valid[..., None], bary, torch.zeros_like(bary))
-    return {"face": face, "bary": bary, "valid": valid, "query_uv": query}
+    face = torch.where(valid, face, torch.full_like(face, -1))
+    print(f"04 UV lookup: covered={int(covered.sum())}, valid={int(valid.sum())}, "
+          f"boundary_excluded={int(boundary_excluded.sum())}, max_outside={max_outside_px:.6f}px")
+    return {"face": face, "bary": bary.to(vt.dtype), "valid": valid,
+            "query_uv": query.to(vt.dtype), "boundary_excluded": boundary_excluded}
 
 
 def interpolate_vertices(vertices, faces, lookup):
@@ -167,6 +197,7 @@ def main():
     good=tbn[0, ~bad[0]]
     if len(good) and ((torch.linalg.det(good)-1).abs().max()>1e-4):
         raise ValueError("TBN이 right-handed 회전이 아니다. UV mirror/winding을 확인하세요.")
+    
     h, w = scene["manifest"]["height"], scene["manifest"]["width"]
     K, w2c = scene["K"].to(args.device), scene["w2c"].to(args.device)
     color_sum, weight_sum = torch.zeros_like(xyz), torch.zeros_like(xyz[..., :1])
@@ -229,6 +260,7 @@ def main():
     palette = torch.stack(((ids*.618)%1, (ids*.381)%1, (ids*.173)%1))*lookup["valid"][None]
     L03.save_image(out/"face_index.png", palette)
     L03.save_json(out/"summary.json", {"uv_size":args.uv_size, "valid_texels":int(lookup["valid"].sum()),
+                   "boundary_excluded_texels":int(lookup["boundary_excluded"].sum()),
                    "observed_fraction":float(observed.sum()/lookup["valid"].sum()),
                    "degenerate_faces":int(bad.sum()), "texture_frame_ids":train,
                    "normalization":"single-identity valid XYZ per-channel mean/std; scratch only"})

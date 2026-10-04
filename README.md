@@ -7,6 +7,11 @@
   - [FiCA (Preprint)](https://arxiv.org/pdf/2606.24232)
 - ELITE (26/10/03)
   - I want to implement from scratch. First, extract FLAME meshe from a monocular video in NeRSemble dataset. Second, We make Canonical geometry/texture uv map to aligned with previous extracted FLAME mesh. And then, we predict/bind on Gaussian Parameter map. So we can render using naive 2DGS.
+    - [O] Video → Tracking (2, 3)
+    - [ ] Tracking Result → Canonical UV (4)
+    - [ ] UV represent → Gaussian Map (5)
+    - [ ]  Gaussian Map → Avatar (6, 7, 8)
+    - [ ]  animation & eval (9, 10)
   - [ELITE (CVPR 2026)](https://arxiv.org/abs/2601.10200)
   
 
