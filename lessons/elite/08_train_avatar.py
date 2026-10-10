@@ -8,6 +8,8 @@ FLAME tracking/UV lookup은 고정하고 network의 encoder/U-Net/두 head는 �
 CUDA_VISIBLE_DEVICES=2 python 08_train_avatar.py --experiment avatar
 CUDA_VISIBLE_DEVICES=2 python 08_train_avatar.py --experiment avatar --resume
 학습 설정은 avatar_config.json. 새 설정은 새 experiment에 저장한다.
+preview는 고정 frame을 step 0부터 주기적으로 eval해 같은 조건의 변화를 저장한다.
+preview/0.jpg, 100.jpg, ...: frame별 reference | render | absolute error x4.
 """
 
 import argparse
@@ -39,7 +41,7 @@ def code_hashes():
 
 def package_versions():
     import importlib.metadata
-    names=("torch","torchvision","numpy","lpips","diff-surfel-rasterization","nvdiffrast","pytorch3d")
+    names=("torch","torchvision","numpy","roma","lpips","diff-surfel-rasterization","nvdiffrast","pytorch3d")
     result={}
     for name in names:
         try:result[name]=importlib.metadata.version(name)
@@ -49,7 +51,7 @@ def package_versions():
 
 
 def validate_config(config,uv):
-    if config["format"]!="elite_single_identity_scratch_v1":
+    if config["format"]!=L03.lesson(6).MODEL_FORMAT:
         raise ValueError("checkpoint/config format 불일치")
     if config["uv_size"]!=uv["uv_size"]:
         raise ValueError("04 uv-size와 avatar_config.json이 다르다.")
@@ -71,6 +73,11 @@ def validate_config(config,uv):
         raise ValueError("optimizer/warmup 설정을 확인하세요.")
     if t["background"] not in ("white","random"):
         raise ValueError("background는 white 또는 random")
+    if type(t.get("preview_every",0)) is not int or t.get("preview_every",0)<0:
+        raise ValueError("preview_every는 0(끄기) 또는 양의 정수")
+    frames=t.get("preview_frames",[])
+    if not isinstance(frames,list) or any(type(i) is not int or i<0 for i in frames) or len(frames)!=len(set(frames)):
+        raise ValueError("preview_frames는 중복 없는 frame ID 목록. []이면 첫 train/validation frame")
     if config["loss"]["lpips"]<=0:
         raise ValueError("최종 perceptual 평가를 위해 LPIPS weight>0을 사용하세요.")
     if any(value<0 for value in config["loss"].values()):
@@ -130,7 +137,7 @@ def image_metrics(prediction,target,alpha,loss):
 
 
 @torch.no_grad()
-def evaluate(model,surface,dataset,loss,ids,device,destination=None):
+def evaluate(model,surface,dataset,loss,ids,device,destination=None,panels=None):
     was_training=model.training
     model.eval()
     background=torch.ones(3,device=device)
@@ -144,10 +151,14 @@ def evaluate(model,surface,dataset,loss,ids,device,destination=None):
         mask_a,mask_b=rendered["alpha"]>.5,targets["alpha"][0]>.5
         row.update(frame_id=int(index),alpha_iou=float((mask_a&mask_b).sum()/(mask_a|mask_b).sum().clamp_min(1)))
         rows.append(row)
-        if destination and slot<4:
+        if (destination or panels is not None) and slot<4:
             # Reference | render | absolute error. 각 panel은 같은 image/camera다.
             image=torch.cat((target,rendered["rgb"],(target-rendered["rgb"]).abs()*4),-1)
-            L03.save_image(Path(destination)/f"{index:06d}.jpg",image)
+            if destination:
+                L03.save_image(Path(destination)/f"{index:06d}.jpg",image)
+            if panels is not None:
+                # Preview는 중간 파일 없이 이 CPU tensor들을 모아 이미지 하나만 저장한다.
+                panels.append(image.cpu())
     model.train(was_training)
     return {"mean":{key:sum(r[key] for r in rows)/len(rows) for key in rows[0] if key!="frame_id"},"frames":rows}
 
@@ -159,6 +170,47 @@ def gradient_report(model):
         gradients=[p.grad.detach().square().sum() for p in module.parameters() if p.grad is not None]
         report[name]=float(torch.stack(gradients).sum().sqrt()) if gradients else 0.
     return report
+
+
+def preview_frames(scene,training):
+    """빈 설정에서는 첫 train/validation frame을 고른다. 학습 sampling과 별개다."""
+    if not training.get("preview_every",0):
+        return []
+    ids=training.get("preview_frames",[]) or [scene["split"]["train"][0],scene["split"]["validation"][0]]
+    if any(i>=scene["manifest"]["num_frames"] for i in ids):
+        raise ValueError("preview_frames에 sequence 범위 밖 frame ID가 있다.")
+    return list(ids)
+
+
+def save_preview(model,surface,dataset,loss,ids,device,out,completed):
+    """고정 frame/camera/흰 배경으로 비교한다. evaluate가 eval/no_grad 후 원래 모드를 복구한다.
+
+    모든 고정 frame을 세로로 이어 preview/<step>.jpg 한 장만 저장한다.
+    Preview metric은 best.pt 선택에 사용하지 않는다. train frame과 validation frame을 구분한다.
+    """
+    from PIL import Image,ImageDraw,ImageFont
+    directory=out/"preview"
+    directory.mkdir(parents=True,exist_ok=True)
+    tensors=[]
+    report=evaluate(model,surface,dataset,loss,ids,device,panels=tensors)
+    membership={i:name for name in ("train","validation","gap") for i in dataset.scene["split"][name]}
+    panels=[Image.fromarray((tensor.clamp(0,1).permute(1,2,0).numpy()*255).round().astype(np.uint8))
+            for tensor in tensors]
+    header=32
+    montage=Image.new("RGB",(panels[0].width,sum(image.height+header for image in panels)),"white")
+    draw=ImageDraw.Draw(montage)
+    try:font=ImageFont.truetype("DejaVuSans.ttf",18)
+    except OSError:font=ImageFont.load_default()
+    y=0
+    for i,image in zip(ids,panels):
+        draw.text((8,y+5),f"step {completed} | frame {i} ({membership[i]}) | reference / render / error x4",fill="black",font=font)
+        montage.paste(image,(0,y+header))
+        y+=image.height+header
+    path=directory/f"{completed}.jpg"
+    temporary=path.with_suffix(".tmp")
+    montage.save(temporary,format="JPEG",quality=92)
+    temporary.replace(path)
+    print(f"preview {completed}: fixed frames={ids} foreground PSNR={report['mean']['foreground_psnr']:.3f} | {path}",flush=True)
 
 
 def main():
@@ -176,6 +228,9 @@ def main():
     uv=L03.lesson(5).read_uv(scene)
     config=L03.lesson(6).load_config(args.config)
     validate_config(config,uv)
+    fixed_preview=preview_frames(scene,config["training"])
+    if len(fixed_preview)>4:
+        raise ValueError("preview_frames는 4개 이하를 사용하세요. 전체 평가는 validation/10을 사용한다.")
     out=experiment_dir(scene,args.experiment)
     if args.resume and not (out/"latest.pt").is_file():
         raise FileNotFoundError("resume할 latest.pt가 없다.")
@@ -208,7 +263,8 @@ def main():
         restore_random_state(checkpoint["random_state"])
     metadata={"config":config,"data_fingerprint":dataset.fingerprint,"code_hashes":hashes,
               "versions":package_versions(),"scope":"single-person scratch; no pretrained MGPM/enhancer/generative supervision",
-              "sequence":args.sequence,"tracking_run":args.run,"experiment":args.experiment}
+              "sequence":args.sequence,"tracking_run":args.run,"experiment":args.experiment,
+              "preview_frame_ids":fixed_preview}
     L03.save_json(out/"experiment.json",metadata)
     train_ids=torch.tensor(scene["split"]["train"])
     validation=scene["split"]["validation"]
@@ -219,6 +275,8 @@ def main():
                     scheduler=scheduler.state_dict(),random_state=random_state(),best_foreground_psnr=best)
     model.train()
     clock=time.monotonic()
+    if fixed_preview and not args.resume:
+        save_preview(model,surface,dataset,loss,fixed_preview,device,out,completed=0)
     for step in range(start,training["steps"]):
         # 공유 UV에 대해 다른 driving/target을 sample한다. Frame ID 자체는 network에 넣지 않는다.
         ids=train_ids[torch.randint(len(train_ids),(training["batch_size"],))].tolist()
@@ -247,6 +305,8 @@ def main():
                 stream.write(json.dumps(record)+"\n")
             print(f"step {completed:6d} loss={record['total']:.5f} photo={record['raw']['photo']:.5f} "
                   f"alpha={record['raw']['alpha']:.5f} gradient={float(grad_norm):.4f}",flush=True)
+        if fixed_preview and (completed%training["preview_every"]==0 or completed==training["steps"]):
+            save_preview(model,surface,dataset,loss,fixed_preview,device,out,completed)
         if completed%training["validate_every"]==0 or completed==training["steps"]:
             report=evaluate(model,surface,dataset,loss,validation,device,out/"validation"/f"{completed:06d}")
             L03.save_json(out/"validation"/f"{completed:06d}.json",report)

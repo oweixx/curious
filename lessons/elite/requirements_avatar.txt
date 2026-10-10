@@ -1,3 +1,5 @@
 # Tracking 환경의 torch/torchvision/numpy/CUDA extension을 임의로 교체하지 않는다.
 # 2DGS compiled backend는 GUIDE의 pinned source 명령으로 별도 설치한다.
 lpips==0.1.4
+# 공식 ExprEncoder와 동일한 axis-angle -> quaternion 계산.
+roma==1.5.3

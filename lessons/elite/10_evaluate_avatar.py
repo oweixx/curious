@@ -1,6 +1,7 @@
 """10 — 모든 train/held-out frame을 평가하고 실패 frame과 시간적 오차를 찾는다.
 
 CUDA_VISIBLE_DEVICES=2 python 10_evaluate_avatar.py --experiment avatar
+연결을 먼저 확인할 때는 --max-frames 40으로 선택 split의 앞 40 frame만 평가할 수 있다.
 PSNR/foreground PSNR/SSIM/LPIPS/alpha IoU와 temporal residual L1을 저장한다.
 Temporal residual = (render_t-render_previous) - (target_t-target_previous).
 이 값은 실제 표정 움직임 자체를 flicker로 오해하지 않도록 reference 변화를 빼지만,
@@ -28,19 +29,26 @@ def main():
     parser.add_argument("--experiment",default="avatar")
     parser.add_argument("--checkpoint",choices=("best.pt","latest.pt"),default="best.pt")
     parser.add_argument("--split",choices=("all","train","validation"),default="all")
+    parser.add_argument("--max-frames",type=int,default=0,help="0이면 선택 split 전체; 연결 확인용 frame 수 제한")
     args=parser.parse_args()
+    if args.max_frames<0:
+        parser.error("max-frames>=0 필요")
     device=torch.device(args.device)
     torch.cuda.set_device(device)
     scene,checkpoint,model,surface,dataset=L03.lesson(9).load_avatar(args.sequence,args.run,args.experiment,args.checkpoint,device)
     config=checkpoint["config"]
     uv=L03.lesson(5).read_uv(scene)
     loss=L03.lesson(7).AvatarLoss(config,uv,device)
-    out=L03.output_dir(10,args.sequence,args.run)/args.experiment/f"{args.checkpoint[:-3]}_{args.split}"
+    suffix=f"_first{args.max_frames}" if args.max_frames else ""
+    out=L03.output_dir(10,args.sequence,args.run)/args.experiment/f"{args.checkpoint[:-3]}_{args.split}{suffix}"
     if out.exists() and any(out.iterdir()):
         raise FileExistsError("평가 출력이 이미 있다. 기존 report를 보관하고 새 평가를 실행하세요.")
     out.mkdir(parents=True,exist_ok=True)
     count=scene["manifest"]["num_frames"]
     ids=list(range(count)) if args.split=="all" else scene["split"][args.split]
+    selected_count=len(ids)
+    if args.max_frames:
+        ids=ids[:args.max_frames]
     membership={i:name for name in ("train","validation","gap") for i in scene["split"][name]}
     rows=[]
     background=torch.ones(3,device=device)
@@ -93,6 +101,8 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
     L03.save_json(out/"metrics.json",{"summary":summary,"worst_frames":worst,"checkpoint_step":checkpoint["step"],
+        "selected_split":args.split,"selected_split_frames":selected_count,"evaluated_frames":len(ids),
+        "max_frames":args.max_frames,"evaluation_complete":len(ids)==selected_count,
         "scope":"single identity; tracking on full sequence; UV texture uses train RGB only; held-out Gaussian RGB evaluation",
         "selection":"best.pt selected on validation foreground PSNR; validation is not an untouched test set",
         "temporal_metric":"reference-subtracted consecutive-frame RGB residual; no optical-flow alignment"})

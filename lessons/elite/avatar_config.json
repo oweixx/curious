@@ -1,5 +1,5 @@
 {
-  "format": "elite_single_identity_scratch_v1",
+  "format": "elite_official_mgpm_scratch_v2",
   "seed": 42,
   "uv_size": 512,
   "image_max_side": 1024,
@@ -18,6 +18,8 @@
     "warmup_steps": 500,
     "grad_clip": 0.5,
     "log_every": 50,
+    "preview_every": 100,
+    "preview_frames": [],
     "validate_every": 1000,
     "checkpoint_every": 1000,
     "validation_frames": 16,

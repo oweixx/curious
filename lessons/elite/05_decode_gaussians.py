@@ -114,8 +114,10 @@ class SurfaceMap:
             raise ValueError("network output과 04 UV lookup의 해상도가 다르다.")
         def flat(value):
             return value.reshape(b,h*w,*value.shape[3:])[:,self.indices]
+        
         geo = flat(geometry_map.permute(0,2,3,1))
         app = flat(appearance_map.permute(0,2,3,1))
+        
         base, frame = flat(points), flat(rotations)
         coarse = torch.tanh(geo[..., :3])*.2
         fine = torch.tanh(geo[..., 9:12])*.1
@@ -303,15 +305,20 @@ def main():
         parser.error("frame 범위를 확인하세요.")
     uv = read_uv(scene)
     size = uv["uv_size"]
+    
     surface = SurfaceMap(scene,uv,args.device)
     geometry_map = torch.zeros(1,13,size,size,device=args.device)
     geometry_map[:,3:5] = initial_scale_logit(size)
     appearance = uv["texture"][None].to(args.device)-.5
     points, rotations = surface.posed_surface([args.frame])
+    
+    
     with torch.no_grad():
         decoded = surface.decode(geometry_map,appearance,points,rotations)
         h,w = scene["manifest"]["height"],scene["manifest"]["width"]
         image = render(decoded,0,scene["K"].to(args.device),scene["w2c"].to(args.device),h,w,torch.ones(3,device=args.device))
+        
+        
     out = L03.output_dir(5,args.sequence,args.run)
     L03.save_image(out/f"{args.frame:06d}_initial_rgb.png",image["rgb"])
     L03.save_image(out/f"{args.frame:06d}_initial_alpha.png",image["alpha"])

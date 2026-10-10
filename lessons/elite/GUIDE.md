@@ -11,8 +11,9 @@
 ## 이번에 만든 파일과 진행 순서
 
 현재 **01~10의 코드가 모두 작성되어 있다.** 03~10은 아래의 순서로 실행하며 읽는다.
-코드 작성과 정적 검증은 완료했지만 agent가 GPU 실행/학습/품질 검증을 대신 수행한 것은
-아니다. 실제 CUDA 연결은 05의 backward 진단, 최종 품질은 08~10의 실행 결과로 확인한다.
+코드와 정적 검증에 더해 06의 공식 network 비교, 08의 짧은 학습/resume, 09의 영상/UV
+저장과 10의 일부 frame 평가까지 GPU 2번에서 확인했다. 전체 학습의 수렴과 최종 품질은
+별도로 확인한다.
 
 | 순서 | 내용 | 실제 결과물과 확인할 것 |
 |---|---|---|
@@ -62,10 +63,11 @@ UV map, TBN, U-Net, 2DGS 각각을 ELITE만의 새로운 발명으로 설명하�
 
 ## 표현과 network에서 구현할 항목
 
-ELITE의 공개 구현을 읽고 다음 계산을 04~08의 graph에 포함했다. 06의 network는
-기본 PyTorch layer로 작성한 single-identity scratch 구현이며 공개 MGPM checkpoint와
-state_dict가 호환되지 않는다. 논문의 여러 identity에 대한 prior 학습을 재현했다고
-해석하지 않는다. 정확한 차이는 아래 '공개 구현과 이번 학습의 차이'를 읽는다.
+ELITE의 공개 구현을 읽고 다음 계산을 04~08의 graph에 포함했다. 06은 공식 learned
+network의 연산, 초기화, module 이름과 weight normalization을 그대로 옮겼다. 임의의
+scale bias/output gain을 추가하지 않는다. Weight는 처음부터 초기화하고 한 사람으로
+학습하므로 다인물 pretrained prior를 재현한 것은 아니다. 전처리/고정 decoding/loss의
+차이는 아래 '공개 구현과 이번 학습의 차이'를 읽는다.
 
 ```text
 Video -> RGB + alpha -> VHAP/FLAME tracking
@@ -694,27 +696,517 @@ RGB/alpha loss를 계산하고 geometry/appearance map까지 finite nonzero grad
 검사한다. `backward_check.json`에 채널별 gradient를 기록한다. GPU 호환성과 연결을 확인한
 뒤 08로 간다.
 
-## 06: Network에서 driving은 어디에 들어가는가
+## 06: Network를 입력에서 gradient까지 읽기
+
+06의 목표는 **canonical 표면의 위치 대응을 유지하면서, 표정과 pose에 따라 Gaussian
+parameter를 생성하는 학습 함수를 코드로 이해하는 것**이다. 단순히 U-Net의 layer 이름을
+외우는 대신 입력의 의미, 중간 feature, 출력의 해석, loss의 역방향 경로를 연결한다.
+아래에서 `B`는 batch size, `H=W=512`는 UV 해상도다. `[B,C,H,W]`의 마지막 두 축은
+카메라 이미지의 pixel이 아니라 canonical UV texel이다.
+
+### 06.1 먼저 전체 경로: 같은 사람, 다른 표정
+
+한 사람에게 고정된 canonical 입력을 `X`, 프레임 t의 FLAME driving을 `p_t`라고 하자.
+학습 가능한 파라미터를 θ, φ, ψ, ω로 나누면 계산은 다음과 같다.
+
+```text
+e_t = ExprEncoder_θ(p_t)                  [B,128]
+F_t = SongUNet_φ(X, e_t)                 [B,16,512,512]
+G_t = GeometryHead_ψ(F_t)                [B,13,512,512]
+A_t = AppearanceHead_ω(F_t)              [B, 3,512,512]
+```
+
+`Mesh2Gaussian.forward`가 전체 입구이고 `GaussianMapDecoder.forward`가 뒤의 세 연산이다.
+여기서 만든 `G_t`, `A_t`를 05의 `SurfaceMap.decode`가 posed 표면과 합쳐 실제 Gaussian
+위치/scale/회전/opacity/RGB로 바꾼다. 렌더링과 loss는 07~08에 연결되어 있다.
+
+```mermaid
+flowchart LR
+    X["고정 canonical RGB/XYZ · 6채널"] --> U["SongUNet"]
+    P["프레임별 FLAME expression/pose"] --> E["ExprEncoder · 128차원"]
+    E --> U
+    U --> F["shared UV feature · 16채널"]
+    F --> G["geometry head · raw 13채널"]
+    F --> A["appearance head · raw 3채널"]
+    P --> S["고정 FLAME forward · posed 표면/TBN"]
+    G --> D["고정 Gaussian decoding"]
+    A --> D
+    S --> D
+    D --> R["2DGS rendering + camera"]
+    R --> L["실제 frame과 loss 비교"]
+```
+
+입을 다문 frame과 벌린 frame을 비교할 때 `X`는 같다. `p_t`가 달라지면 `e_t`가 달라지고,
+그 조건을 받은 network가 입 주변 Gaussian offset, 방향, 색 등을 다르게 만들 수 있다.
+**동시에 FLAME 자체도 입을 움직인다.** 따라서 animation은 아래 두 경로의 합이다.
+
+1. `p_t → FLAME forward → posed 표면`: 기존 FLAME이 제공하는 기본 deformation.
+2. `p_t → ExprEncoder → UV network → Gaussian Map`: 관측에 맞춰 학습하는 추가 변화.
+
+이 설명은 구현의 계산 경로를 해석한 것이다. 학습이 입 주변에만 완벽하게 국소화되거나
+모든 새로운 표정에 일반화한다는 보장은 아니다. 학습 데이터와 objective가 그 동작을 결정한다.
+
+### 06.2 입력 세 종류를 구분하기
+
+| 입력 | Shape | 담는 정보 | 이번 학습에서 optimizer가 수정하는가 |
+|---|---|---|---|
+| Canonical RGB | `[B,3,512,512]` | train 관측으로 fusion한 identity의 색/질감, 입력 범위 `[-1,1]` | 아니오 |
+| Canonical XYZ | `[B,3,512,512]` | 각 UV texel이 개인 encoding mesh의 어디에 대응하는지, normalization된 좌표 | 아니오 |
+| Driving | expr `[B,100]`, rot/trans/neck/jaw 각각 `[B,3]`, eyes `[B,6]` | 프레임별 expression·전체 rigid transform·관절 회전 | 아니오 |
+
+`SurfaceMap.uv_input`과 06의 `main`은 채널 축으로 RGB와 XYZ를 연결한다.
+
+```text
+X[:,0:3] = texture * 2 - 1
+X[:,3:6] = normalized_xyz
+X.shape  = [B,6,512,512]
+```
+
+XYZ는 displacement가 아니라 **입력 표면의 위치**다. RGB도 network가 예측한 appearance
+map이 아니라 입력 texture다. 05에서 수동으로 초기화했던 geometry 13채널/appearance
+3채널을 그대로 network 입력으로 넣는 구조가 아니다.
+
+Canonical 입력은 03~04에서 만든 개인 encoding mesh에서 온다. Gaussian 배치용 posed
+base는 `FrameGeometry.forward(personal=False)`를 사용해 shape/static offset을 제거하고
+frame의 expression/pose를 적용한다. 그래서 입력 XYZ를 최종 Gaussian 중심으로 그대로
+복사하는 것이 아니다. 개인 형상은 입력에 담겨 있고, network가 base 대비 residual로
+이를 표현하도록 학습한다. 이 구분은 03과 05에서 읽었던 encoding/base의 구분과 같다.
+
+`parameter_batch`는 저장된 tracking parameter에서 frame index를 선택할 뿐이다. 06이
+RGB 영상에서 FLAME parameter를 새로 추정하는 것은 아니다. 카메라 K/w2c는 renderer에
+별도로 전달한다. Driving의 rotation/translation과 렌더링 카메라는 구분해서 읽는다.
+
+UV 전체 사각형에는 표면에 대응하지 않는 texel도 있다. CNN은 사각형 전체를 처리하고,
+05가 valid mask의 index로 실제 Gaussian을 선택한다. Mask 밖 출력은 배치하지 않지만
+convolution을 통해 내부 feature에 영향을 줄 수 있다. 또 UV seam을 사이에 두고 3D에서는
+이웃인 표면이 UV에서는 멀 수 있다. 2D convolution이 mesh adjacency를 자동으로 보존하지는 않는다.
+
+### 06.3 ExprEncoder: tracking 수치가 조건 vector가 되는 과정
+
+이름에 expression이 들어가지만 실제로는 expression과 여러 pose 항목을 함께 받는다.
+`n_embs=128`에서 각 branch는 다음과 같다.
+
+| Branch | 고정 변환 후 입력 차원 | Learned projection 출력 |
+|---|---|---|
+| `proj_expr` | expression 100 | 128 |
+| `proj_rottrans` | rotation quaternion 4 + translation 3 = 7 | 32 |
+| `proj_neck` | neck quaternion 4 | 32 |
+| `proj_jaw` | jaw quaternion 4 | 32 |
+| `proj_eyes` | 왼눈 quaternion 4 + 오른눈 quaternion 4 = 8 | 32 |
+
+회전의 tracked axis-angle 3개를 Roma의 `rotvec_to_unitquat`로 xyzw quaternion 4개로 바꾼다.
+이 함수에는 학습 weight가 없다. 회전의 다른 표현을 입력하는 것이며 `q`와 `-q`가 같은
+회전을 나타내는 등의 모호성까지 없어지는 것은 아니다. 여기의 xyzw와 05 renderer에
+전달하는 wxyz의 순서를 섞지 않는다.
+
+각 branch는 `LinearWN → LeakyReLU(0.2)`다. 서로 다른 항목을 각각 projection한 뒤
+`[expr, jaw, eyes, rottrans, neck]` 순서로 concatenate한다.
+
+```text
+128 + 32 + 32 + 32 + 32 = 256
+concat [B,256] → LinearWN 256→256 → LeakyReLU
+               → LinearWN 256→256 → LeakyReLU
+               → LinearWN 256→128
+embedding e_t: [B,128]
+```
+
+이 128차원의 각 번호에 '눈 깜박임', '입 벌리기' 같은 이름을 미리 붙이지 않는다. Loss를
+줄이도록 학습된 feature다. FLAME shape coefficient나 frame ID를 이 encoder에 넣지는 않는다.
+Identity 정보는 canonical RGB/XYZ 경로에서 들어온다.
+
+### 06.4 SongUNet: UV 위치와 넓은 문맥을 함께 처리하기
+
+앞의 convolution은 작은 UV 주변을 함께 보며, 해상도를 줄일수록 하나의 feature가 원래
+입력의 더 넓은 영역에 영향을 받는다. 다시 해상도를 올릴 때 encoder의 feature를 skip으로
+연결해 위치별 세부 정보를 전달한다. 이 구조를 입 주변 예시에 적용하면 작은 영역의 질감과
+주변 얼굴 형태를 함께 참고하는 기능으로 이해할 수 있다.
+
+기본 설정은 `model_channels=32`, `channel_mult=[1,2,2,2,2,2]`, `num_blocks=1`이다.
+Encoder의 각 level 마지막 출력은 다음과 같다. Down block 중간의 채널이 항상 다음 행의
+채널과 같다는 뜻은 아니다. 예를 들어 첫 256 down은 32채널이고 뒤 block에서 64채널이 된다.
+
+| UV 크기 | Encoder level 마지막 feature | 역할 |
+|---|---|---|
+| 512×512 | `[B,32,512,512]` | 입력 6채널을 feature로 옮김 |
+| 256×256 | `[B,64,256,256]` | downsampling 후 feature 처리 |
+| 128×128 | `[B,64,128,128]` | 더 넓은 UV 문맥 |
+| 64×64 | `[B,64,64,64]` | 더 넓은 UV 문맥 |
+| 32×32 | `[B,64,32,32]` | 더 넓은 UV 문맥 |
+| 16×16 | `[B,64,16,16]` | bottleneck 및 attention |
+
+여기서 '16×16의 한 pixel'은 원래 512 UV texel 하나와 동일한 점을 뜻하지 않는다.
+Downsample된 공간 feature다. Bottleneck을 시각화한 색을 원래 3D XYZ 값으로 읽으면 안 된다.
+
+`enc`/`dec`는 실행 순서를 보존하는 `ModuleDict`다. Encoder는 최초 conv와 block,
+그 뒤 각 level의 down과 block 출력을 저장한다. 기본 설정에서 총 12개의 skip이다.
+Decoder는 각 해상도에서 `num_blocks+1=2`개의 block으로 이를 순서대로 소비한다.
+`skips.pop()`은 최근 저장된 같은 해상도의 feature를 꺼낸다.
+
+```text
+현재 decoder feature [B,64,16,16]
+encoder skip         [B,64,16,16]
+cat(dim=1)           [B,128,16,16]
+UNetBlock            [B,64,16,16]
+```
+
+`cat`은 두 feature를 더하는 연산이 아니다. 채널 수를 늘린 다음 learned convolution이
+섞는 연산이다. Block 내부의 residual addition과 구분한다. 최종 `aux_norm → SiLU →
+aux_conv`가 512×512에서 16채널 shared feature를 만든다. 기본 `decoder_type='standard'`
+에서는 출력 projection이 마지막 해상도에만 있다.
+
+SongUNet은 diffusion 연구에서 쓰인 계열의 backbone이지만 **이 avatar 경로는 한 번의
+조건부 forward**다. `channel_mult_noise=0`이고 noise/timestep 입력, denoising 반복,
+diffusion scheduler가 없다. `PositionalEmbedding`/`FourierEmbedding`과 `aux_*`의 일부
+분기는 원본의 선택지를 보존한 정의이며 이번 설정에서 모두 실행되는 것은 아니다.
+
+### 06.5 Driving 주입: global vector가 UV별 변화를 만드는 방법
+
+`SongUNet.forward`가 `e_t [B,128]`에 `map_layer0/1`과 각각의 SiLU를 적용한다.
+이 설정의 `emb_channels=32*2=64`여서 결과는 `[B,64]`다. 같은 vector를 모든
+`UNetBlock`에 전달하지만 각 block의 `affine` weight는 독립적이다.
+
+```text
+block affine: [B,64] → [B,C_out]
+unsqueeze:                [B,C_out,1,1]
+broadcast over UV:        [B,C_out,H,W]에 더함
+```
+
+한 sample 안에서 같은 channel shift를 모든 UV 위치에 넣는다. 그런데 각 위치의 기존
+feature가 다르고 normalization, 비선형 함수, convolution, 위치별 head bias도 작용한다.
+따라서 최종 map 변화가 모든 위치에서 같은 상수일 필요는 없다. 다만 이 주입 방식 자체가
+'jaw 변화는 입에만 적용'이라는 명시적인 공간 mask를 제공하지는 않는다.
+
+기본 `UNetBlock.forward`를 식으로 펼치면 다음과 같다. `N0/N1`은 GroupNorm,
+`S`는 SiLU, `C0/C1`은 convolution, `a(e)`는 affine projection이다.
+
+```text
+h0 = C0(S(N0(x)))                    # up/down인 block이면 크기도 변경
+h1 = S(N1(h0 + a(e)[:,:,None,None]))  # additive conditioning
+h2 = S(N1(h1))                       # 동일 norm1을 한 번 더 사용
+h3 = C1(dropout(h2))
+y  = (h3 + skip(x)) / sqrt(2)
+```
+
+코드 변수 이름이 `film_emb`여도 이 설정은 `adaptive_scale=False`라 scale+shift 두 항을
+예측하지 않는다. `adaptive_scale=True`의 분기는 선택지로 남아 있다. 또 원본에는 위의
+norm/SiLU가 실제로 두 번 있다. 이 구현을 이해하는 단계에서 '중복이니 제거'하면 다른
+network가 된다. 두 번 사용되는 `norm1`은 별개 layer가 아니라 같은 weight/bias를 공유한다.
+
+`skip(x)`는 채널/공간 크기가 같으면 identity, 다르면 projection과 resampling이다.
+Residual addition은 깊은 연산에 이전 feature를 연결한다. `1/sqrt(2)`는 합친 feature의
+크기를 조절하는 고정 값이다. Dropout의 기본 확률은 0.1이고 train에서만 켜진다.
+GroupNorm은 각 sample 내부에서 계산하므로 batch size=1에서도 동작한다. BatchNorm의
+running statistics를 사용하는 구조가 아니다.
+
+### 06.6 Attention: UV의 멀리 떨어진 feature를 연결하기
+
+기본 512 해상도에서는 지정된 16×16 block과 bottleneck에 attention이 있다. 16×16은
+256개의 위치이므로 한 head의 attention 행렬은 sample별 `[256,256]`이다.
+512×512 전체에서 만들면 `[262144,262144]`가 되므로 메모리 부담이 매우 커진다.
+
+```text
+Q,K,V: [B*heads,C_head,N], N=H*W
+W[q,k] = softmax_k(Q_q · K_k / sqrt(C_head))
+out_q  = sum_k W[q,k] * V_k
+```
+
+Query 위치는 현재 위치가 어떤 feature를 찾는지, key는 다른 위치가 제공하는 대응 feature,
+value는 실제로 전달할 정보를 나타낸다. `AttentionOp`는 `W`를 계산하고 `UNetBlock`의
+einsum이 value를 섞는다. Projection 후 residual로 이전 feature와 합친다.
+이 경로의 Q/K와 softmax 미분은 원본 custom backward에서 FP32로 계산한다.
+
+이는 feature 관계를 학습하는 것이며 texture lookup, barycentric interpolation, 3D mesh
+adjacency를 대체하지 않는다. 모든 UV seam 문제가 attention 하나로 해결되는 것도 아니다.
+`N_views_xa`의 여러 view 결합 분기는 원본에 남아 있지만 이번 lesson에서는 1을 사용한다.
+
+### 06.7 두 head: feature에 Gaussian parameter의 의미를 부여하기
+
+SongUNet의 출력 수가 `13+3=16`이라고 해서 그 앞 13개가 이미 geometry라고 읽지 않는다.
+실제로 두 head **모두 16채널 전체**를 받으며, 출력에만 13/3채널의 해석을 부여한다.
+현재 코드에서 `UNetWBConcat`은 geometry/appearance별로 독립적인 weight를 가진다.
+
+두 head는 마지막 출력 채널 수를 제외하면 같은 구조다. Head 내부의 `F`는
+`n_init_ftrs=16`이라는 정수이며 `torch.nn.functional`을 의미하지 않는다.
+
+| Head 단계 | Output `[C,H,W]`, batch 축 생략 |
+|---|---|
+| 입력 `x1` | `[16,512,512]` |
+| down1 `x2` | `[16,256,256]` |
+| down2 `x3` | `[32,128,128]` |
+| down3 `x4` | `[64,64,64]` |
+| down4 `x5` | `[128,32,32]` |
+| down5 `x6` | `[256,16,16]` |
+| down6 `x7` | `[512,8,8]` |
+| up0 후 x6 연결 | `[512,16,16]` = 256+256채널 |
+| up1 후 x5 연결 | `[256,32,32]` = 128+128채널 |
+| up2 후 x4 연결 | `[128,64,64]` = 64+64채널 |
+| up3 후 x3 연결 | `[64,128,128]` = 32+32채널 |
+| up4 후 x2 연결 | `[32,256,256]` = 16+16채널 |
+| up5 후 x1 연결 | `[32,512,512]` = 16+16채널 |
+| `out`의 1×1 convolution | geometry `[13,512,512]` / appearance `[3,512,512]` |
+
+Down은 kernel=4/stride=2/padding=1의 convolution, up은 같은 설정의 transposed convolution이다.
+각 뒤에는 LeakyReLU(0.2)가 있다. 마지막 1×1 convolution은 같은 위치의 feature 채널을
+섞지만 그 입력 feature에는 이미 주변/넓은 영역의 정보가 담겨 있다.
+
+Head는 shared feature를 UV 크기 전체에서 다시 처리하는 learned refinement network다.
+학습되는 U-Net이며, 사용자가 제외한 diffusion enhancer와는 다른 부분이다.
+두 head는 direct output을 반환한다. 이전 map에 더하는 residual head나 input RGB를
+그대로 복사하는 연산이 forward에 따로 있는 것은 아니다.
+
+출력의 의미는 05의 고정 decode가 정한다. 아래 식은 **현재 lesson의 decode**이며
+공식 network 연산과 전처리/decoding의 차이는 이 문서 끝의 비교 표를 참고한다.
+
+| Raw 출력 | 의미 | 05에서의 해석 |
+|---|---|---|
+| `G[:,0:3]` | coarse displacement | `0.2*tanh(raw)`의 local T/B/N 세 성분 |
+| `G[:,3:5]` | surface Gaussian 두 축 scale | `0.1*exp(-3.5-softplus(1.5-raw))` |
+| `G[:,5:9]` | local quaternion residual | xyzw identity를 더하고 normalize |
+| `G[:,9:12]` | fine displacement | `0.1*tanh(raw)`의 local T/B/N 세 성분 |
+| `G[:,12:13]` | opacity | `sigmoid(raw)` |
+| `A[:,0:3]` | RGB | `clamp(raw+0.5,0,1)` |
+
+예를 들어 coarse의 raw `[0.1,0,0]`은 world X축으로 0.1 이동하라는 뜻이 아니다.
+먼저 local T축 성분 `0.2*tanh(0.1)`이 되고, 그 프레임의 TBN matrix로 world 변위가 된다.
+`xyz`라는 코드 변수 이름만 보고 좌표계를 판단하지 않는다.
+
+Coarse와 fine은 이름과 범위가 다르지만 현재 lesson에서는 둘 다 같은 UV 해상도의
+출력이고 합쳐서 중심을 옮긴다. 두 항을 서로 다른 의미로 완벽히 분리하도록 강제하는
+supervision은 없다. 이름만으로 반드시 'coarse=identity, fine=expression'이라고 단정하지 않는다.
+
+### 06.8 Weight normalization, untied bias, 초기화까지 읽기
+
+`ExprEncoder`와 두 head의 layer에는 weight normalization이 있다. Backbone의 별도
+`Linear`/`Conv2d`에는 같은 wrapper를 적용하지 않는다. 원본에는 두 layer 계열이 있으므로
+클래스 이름과 실제 호출을 함께 확인한다.
+
+```text
+W = broadcast(g) * v / ||v||₂
+```
+
+이 wrapper의 `g`는 output별이고 `v_dim=None`을 `-1`로 바꿔 `v`의 전체 norm을 사용한다.
+일반 `weight_norm(dim=0)`의 output filter별 norm과 다르다. Optimizer가 학습하는 것은
+`weight_g`, `weight_v`이고 forward hook이 실제 `weight`를 계산한다. `fuse/unfuse`와
+`TensorMappingHook`은 이 표현 및 checkpoint 호환성을 위한 코드다. 처음 전체 경로를
+읽을 때 helper 세부부터 이해할 필요는 없지만 동일 초기화/gradient를 유지하려면 중요하다.
+
+일반 convolution bias는 `[C]`를 모든 위치에 공유한다. 여기의 head는 `[C,H,W]`의
+untied bias를 학습한다. 예를 들어 output geometry bias는 `[13,512,512]`이며 batch에만
+broadcast한다. Kernel은 공간적으로 공유되지만 bias는 UV 위치마다 다르다. 고정된 얼굴
+대응을 이용할 수 있는 대신 위치별 학습 파라미터가 많고, 평행이동 equivariance가 깨진다.
+해상도를 바꾸면 이 bias shape도 바뀌므로 동일 checkpoint를 그대로 읽을 수 없다.
+
+`glorot`는 wrapper를 잠시 fuse한 뒤 실제 weight를 초기화하고 다시 unfuse한다.
+Transposed convolution의 2×2 weight 값은 초기화 순간에 같게 설정한다. 이는 영구적인
+weight sharing 제약이 아니며 이후 optimizer는 원소들을 각각 업데이트한다.
+SongUNet의 residual/attention projection은 작은 `1e-5` gain으로, 최종 backbone output
+conv는 std `1e-3`으로 초기화된다. 이전 재구현의 추가 작은 head gain/scale bias는 제거했다.
+기본 512 설정의 전체 학습 파라미터는 실제 shape log 기준 36,222,880개다.
+
+### 06.9 무엇이 학습되는가: 출력 tensor와 Parameter 구분
+
+08의 `forward_frame_batch`에서 아래 계산을 읽는다.
+
+```text
+G_t,A_t = model(canonical_uv, tracked_parameters)
+points,TBN = surface.posed_surface(frame_ids)
+gaussians = surface.decode(G_t,A_t,points,TBN)
+image = render(gaussians,camera)
+loss = objective(image,target,gaussians)
+loss.backward()
+optimizer.step()
+```
+
+06 network의 encoder/backbone/two heads는 학습된다. Canonical 입력, tracking parameter,
+FLAME model과 UV lookup은 이번 optimizer에 등록되어 있지 않다. `posed_surface`도
+`no_grad()`로 계산한다. Fixed decode/render에는 학습 weight가 없지만 G/A에 대한 미분
+경로가 있어서 network까지 gradient를 전달한다.
+
+```text
+∂L/∂θ = (∂L/∂image) (∂image/∂Gaussian)
+        (∂Gaussian/∂map) (∂map/∂θ)
+```
+
+이 식은 image loss의 경로다. TV/displacement/UV color처럼 map 또는 decoded attribute에
+직접 걸리는 항은 그 위치에서 network로 돌아가는 경로를 추가한다.
+Appearance/geometry head의 gradient는 shared backbone에서 합쳐지고, driving conditioning을
+통해 ExprEncoder까지 이어진다. 특정 parameterization은 영역별로 gradient가 작거나 0일 수
+있다. 예를 들어 RGB clamp 밖에서는 해당 색의 미분이 0이고 tanh/sigmoid는 포화될 수 있다.
+
+`G_t`, `A_t`는 network의 **activation tensor**다. `.retain_grad()`를 호출하면 그 tensor의
+gradient를 관찰할 수 있지만 optimizer가 그 tensor를 직접 업데이트하는 것은 아니다.
+Optimizer가 network의 `nn.Parameter`를 바꾸면 다음 forward에서 map 값이 달라진다.
+Map 자체를 `nn.Parameter`로 등록해서 최적화하는 다른 접근과 구분한다. 05의 수동 map을
+06 network가 모방하도록 supervision을 주는 것도 아니다. 이번 학습 목표는 실제 frame이다.
+
+### 06.10 출력 이미지와 검증 결과 읽기
+
+기본 실행의 `initial_network_outputs.pt`는 처음 random initialization에서의 raw G/A다.
+완성된 avatar나 잘 학습된 prior의 결과가 아니다. `initial_bottleneck_features.png`는
+`decoder.unet.dec.16x16_in0`의 처음 4개 채널을 각각 min/max normalization해 키운 것이다.
+채널 간 색의 절대 크기를 비교할 수 없고 RGB/XYZ/attention map으로 해석하지 않는다.
+어떤 UV 영역에 feature 값의 변화가 생기는지 관찰하는 도구다.
+
+`network_shapes.json`의 해상도/채널을 위 표와 맞춰 보고, 코드의 concat 앞뒤 shape를
+직접 따라가면 출력 파일을 공부에 사용할 수 있다. `model.eval()`은 dropout을 끄고
+`torch.no_grad()`는 계산 graph 기록을 끈다. 두 설정의 역할은 다르다.
+
+원본 비교는 구현의 동일성을 확인한다. 실제 one-step 검증은 renderer/loss와의 연결을
+확인한다. 둘 다 최종 품질이나 학습 수렴의 근거는 아니다. 전체 학습과 held-out 평가는
+08~10에서 확인한다. Canonical UV는 표면의 공통 주소를 제공하지만 새 topology나 귀/뿔을
+자동으로 생성하는 표현은 아니다. 큰 offset을 만들 수 있어도 표면 겹침과 가려짐,
+훈련 관측의 부족 같은 문제는 별도 연구 설계가 필요하다.
+
+### 06.11 이해를 확인하는 작은 관찰
+
+구조를 읽은 뒤 아래 항목을 코드와 함께 설명할 수 있으면 다음 단계로 넘어간다.
+
+1. 입을 벌리는 tracked frame을 선택했을 때 고정 입력 X, embedding e, posed base 중
+   무엇이 바뀌는지 찾아본다. 같은 X에서 G/A가 달라지는 것은 conditioning 경로 때문이다.
+2. 같은 driving으로 G/A를 고정하고 posed base만 다른 frame에 배치한다고 생각해본다.
+   기본 FLAME animation은 남지만 network의 frame별 추가 보정은 빠진다.
+3. 같은 UV 입력에서 jaw만 바꾸는 forward를 관찰하려면 `.eval()`과 같은 weight를 사용한다.
+   Random 초기 network의 작은/큰 변화는 학습된 표정 제어 성능을 의미하지 않는다.
+4. `G[:,5:9]`와 ExprEncoder의 jaw quaternion을 구분한다. 전자는 Gaussian local 회전의
+   learned residual, 후자는 tracked 관절 회전을 encoder에 전달하는 고정 변환이다.
+5. SongUNet의 skip 한 개를 제거하면 왜 decoder input channel과 맞지 않는지 위 128채널
+   예제로 계산한다. Head의 마지막 concat은 왜 32채널인지도 계산한다.
+6. Loss가 G/A까지 도달하는 것과 G/A 자체가 optimizer의 Parameter인 것을 구분한다.
+   08에서 `optimizer`에 전달하는 대상과 06에서 반환하는 tensor를 찾아본다.
+
+공식 코드에 있는 기술을 각각 읽는 것과 ELITE의 기여를 이해하는 것도 구분한다.
+FLAME, UV, U-Net, attention, 2DGS 자체는 기존 구성 요소다. 여기서는 이를 canonical
+geometry/appearance 입력, driving conditioning, Gaussian map 예측과 표면 배치 경로로
+어떻게 연결하는지 공부한다. 여러 identity로 학습한 prior가 갖는 의미는 한 사람으로
+처음부터 학습하는 이번 실험만으로 검증할 수 없다.
+
+### 06.12 이 network가 07~10에서 사용되는 위치
+
+06의 기본 실행에서 저장하는 `initial_network_outputs.pt`는 관찰용 출력이다.
+08이 이를 weight로 불러오는 것은 아니다. **08이 같은 `Mesh2Gaussian(config)`를 새로
+생성해 학습하고, 09/10이 그 학습 checkpoint의 state_dict를 같은 클래스에 로딩한다.**
+
+| 단계 | 06과 연결되는 코드 | 연결의 의미 |
+|---|---|---|
+| 07 | `load_config`, `AvatarLoss.forward` | 같은 설정을 읽고 raw G/A 및 decoded Gaussian으로 loss를 계산 |
+| 08 | `Mesh2Gaussian`, `parameter_batch`, `forward_frame_batch` | network forward → fixed decode → renderer → loss → network 전체 업데이트 |
+| 08의 gradient 기록 | `model.driving/unet/geometry_head/appearance_head` | property로 공식 encoder/decoder 모듈을 참조. 모듈을 중복 등록하지 않음 |
+| 09 | `load_avatar → Mesh2Gaussian → load_state_dict(strict=True)` | 학습된 동일 network로 sequence/driver의 Gaussian Map을 다시 생성 |
+| 10 | 09의 `load_avatar`, 08의 forward/render/metric 함수 | 동일 network와 동일 렌더링 경로에서 실제 frame과 비교 |
+
+Checkpoint의 `model` key에는 `encoder.*`, `decoder.unet.*`,
+`decoder.geo_enhancenet.*`, `decoder.app_enhancenet.*`가 저장된다. Raw map을 frame별로
+학습 weight처럼 저장하는 구조가 아니다. 09의 UV dump는 그때의 network 출력으로
+decode한 attribute의 기록이다. 카메라는 network 입출력에 섞지 않고 renderer에 전달한다.
+
+현재 format은 `elite_official_mgpm_scratch_v2`이며 이전 재구현 checkpoint와 호환되지 않는다.
+새 experiment로 시작하고, resume/render 시에는 config/data/code hash가 같아야 한다.
+03~08의 주석만 수정해도 byte hash는 달라져 기존 checkpoint의 재현성 검사가 거부한다.
+학습 중인 experiment의 소스를 보존하고 구조 변경은 새 experiment에서 진행한다.
+
+실제 연결 검증은 별도 `integration_check_20261010` experiment에서 수행했다.
+UV 512, RGB 1024×702를 사용했고, 기본 학습 설정 파일은 바꾸지 않았다. `.cache/`의
+검증 config에서만 6 step, 작은 LR/짧은 warmup, validation 2 frame, 빠른 geometry ramp를
+설정했다. 기본 30000-step 학습이나 최종 품질 평가로 해석하지 않는다.
+
+| 확인 | 실제 결과 |
+|---|---|
+| 07 dataset | train 337 / validation 96 / gap 46. 실제 RGB/alpha/head mask 및 입력 hash 확인 |
+| 08 train/resume | step 2 checkpoint 저장 후 의도적으로 중단 → 같은 config/code/data로 step 6까지 resume |
+| 08 gradient/loss | 네 모듈 모두 finite nonzero gradient. Normal/distortion 가중치를 켠 step도 정상 처리 |
+| Checkpoint | 공식 state layout의 496 tensor 저장. Resume 이후 476 state tensor 값 변경 |
+| 09 reconstruction | latest.pt strict load, 실제 3 frame의 RGB/비교 MP4, alpha/normal/depth/8개 UV attribute 저장 |
+| 09 driving 교체 | best.pt strict load, 같은 영상의 실제 tracked frame 32/33/34를 driver로 3 frame 렌더링. 다른 identity에 대한 retargeting 품질 검증은 아님 |
+| 10 평가 | 앞 40 frame(train 30/validation 8/gap 2), 39개 temporal pair, finite 지표/CSV/최악 8 frame/두 curve plot 생성 |
+
+검증 중 최대 GPU 할당 메모리는 약 5.22 GiB였다. 종합 기록은
+`outputs/06/person/full/integration_07_10.json`에 있다. 검증용 config/log/checkpoint/video는
+기존 `.cache/`와 `outputs/` ignore 규칙에 들어가며 source를 Git에 올릴 때 포함되지 않는다.
+
+### 실행과 공식 구현 대응 확인
 
 ```bash
 CUDA_VISIBLE_DEVICES=2 python 06_mesh2gaussian_network.py
 ```
 
-`DrivingEncoder`는 expression 100차원과 rotation/translation, neck, jaw, eyes를 각각
-projection한다. Axis-angle을 quaternion으로 바꾸며 최종 128차원 embedding을 만든다.
-한 frame 번호를 embedding으로 외우게 하는 구조가 아니다.
+고정 revision은 `58a7a71dc3e922f589f87882de46154594da0bc3`다. 원본의 필요한 정의를
+06 한 파일에 모아서 import 연결과 설명만 바꿨다. 학습 가능한 연산의 본문은 원본과 같다.
+공식 `MeshUNetPriorModel2DGS`의 학습 모듈 이름 `encoder.*`, `decoder.unet.*`,
+`decoder.geo_enhancenet.*`, `decoder.app_enhancenet.*`를 보존한다. 08/09에서 사용할
+`Mesh2Gaussian.forward`는 이름이 다른 lesson driving 항목을 공식 batch key로 연결한다.
+공식 pretrained checkpoint를 자동으로 읽는 경로는 없다.
 
-`ConditionedSongUNet`은 RGB 3 + normalized XYZ 3을 받는다. 기본 512 UV에서
-512→256→128→64→32→16의 resolution을 거친다. 각 residual block이 driving embedding을
-받고 16x16/bottleneck에 self-attention이 있다. Decoder는 모든 대응 skip을 이용한다.
-`EnhancementHead` 두 개가 feature map을 각각 geometry 13채널과 appearance 3채널로 바꾼다.
-두 head는 6-level U-Net이며 weight norm과 pixel별 spatial bias를 포함한다.
-이 head는 UV refinement를 뜻하며, 이번에 제외한 diffusion enhancer와 다르다.
+처음에는 `Mesh2Gaussian.forward`에서 아래 네 연산을 읽는다.
+
+```text
+embs = encoder(driving)
+features = decoder.unet(canonical RGB/XYZ, embs)
+geometry = decoder.geo_enhancenet(features)
+appearance = decoder.app_enhancenet(features)
+```
+
+`ExprEncoder`는 expression 100차원과 rotation/translation, neck, jaw, eyes를 각각
+projection한다. 원본과 같은 Roma 함수로 axis-angle을 quaternion으로 바꾸고 최종
+128차원 embedding을 만든다. Frame 번호를 embedding으로 외우는 구조가 아니다.
+
+`SongUNet`은 RGB 3 + normalized XYZ 3을 받는다. 기본 512 UV에서
+512→256→128→64→32→16의 resolution을 거친다. `map_layer0/1`은 128차원 driving을
+64차원 block conditioning으로 변환한다. `UNetBlock.affine`이 이를 feature에 broadcast해
+더하며 `adaptive_scale=False`다. 원본의 연속된 두 norm/SiLU를 생략하지 않는다.
+16x16과 bottleneck의 self-attention, FP32 `AttentionOp`의 custom backward, 모든 skip,
+filter를 이용한 up/downsampling도 원본을 유지한다. `SongUNet` 출력 16채널은 두 head에
+들어갈 공유 feature이며 최종 Gaussian Map과는 다른 중간 tensor다.
+
+`UNetWBConcat` 두 개가 feature를 geometry 13채널과 appearance 3채널로 바꾼다.
+각 head는 512→256→128→64→32→16→8로 내려갔다가 다시 512로 올라온다.
+마지막 skip은 head의 원래 입력까지 포함한다. 이 head는 UV refinement network이며
+이번에 제외한 diffusion enhancer와는 다른 모듈이다.
+
+기본 연산까지 이해하려면 `weight_norm_wrapper`, `Conv2dUB`, `ConvTranspose2dUB`,
+`glorot`를 읽는다. Weight의 magnitude `g`는 output별이지만 direction `v`는 전체 norm을
+사용한다(`v_dim=None`을 원본 내부에서 `-1`로 바꾼다). 일반 `weight_norm(dim=0)`으로
+대체하지 않는다. Untied bias는 `[C,H,W]`여서 각 UV 위치별로 학습된다. 전치 convolution은
+원본 `glorot`가 2x2 weight를 같은 값으로 초기화한다. 기존의 작은 output gain과 별도
+scale bias는 제거했으므로 초기 forward의 외형이 이전 재구현과 달라질 수 있다.
+
+원본과의 수치 비교는 아래처럼 실행한다. Cache가 없는 새 checkout에서는
+`--fetch-reference`를 함께 지정하면 고정 revision의 source만 가져온다.
+
+```bash
+CUDA_VISIBLE_DEVICES=2 python 06_mesh2gaussian_network.py --check-parity --device cuda:0 --parity-size 512
+# source cache가 없다면:
+CUDA_VISIBLE_DEVICES=2 python 06_mesh2gaussian_network.py --fetch-reference --check-parity --device cuda:0
+```
+
+별도 원본 source의 SHA256을 확인한 뒤 독립 namespace에서 원본 정의를 읽는다.
+초기 state_dict key/shape/값이 정확히 같은지 확인하고 eval/train forward, 전체 parameter
+gradient와 입력 UV/driving gradient를 비교한다. Train 모드의 dropout seed도 일치시킨다.
+기본 비교 입력은 64x64이며 채널 수/6단/head 구조를 유지한다. `--parity-size 512`는
+실제 설정 해상도로 비교한다. 결과는 `network_parity.json`에 저장한다.
+
+실제 학습 경로까지 확인하려면 다음 명령을 실행한다.
+
+```bash
+CUDA_VISIBLE_DEVICES=2 python 06_mesh2gaussian_network.py --check-training-step --device cuda:0
+```
+
+Train split의 첫 프레임으로 network → fixed Gaussian decode → 2DGS rendering →
+RGB/alpha/SSIM/LPIPS 및 regularization loss → backward → AdamW 업데이트를 한 번 수행한다.
+Step 0에서 normal/distortion의 가중치는 기존 ramp 설정에 따라 0이다. LPIPS의 VGG
+weight가 없으면 `.cache/torch/`에 내려받는다. 같은 dropout seed로 업데이트 전후 loss를
+비교하며 `training_step_check.json`과 전후/target 이미지를 저장한다. Checkpoint는 만들지
+않으며 전체 학습이나 수렴을 평가하는 검증은 아니다.
 
 `network_shapes.json`에서 각 block/head의 실제 tensor shape와 trainable parameter 수를
-확인한다. 이 단계는 random initialization의 forward 확인이며 학습은 08에서 수행한다.
+확인한다. 기본 실행은 random initialization의 forward 확인이며 전체 학습은 08에서 수행한다.
 `initial_network_outputs.pt`와 `initial_bottleneck_features.png`에 초기 출력과 bottleneck의
 4개 feature channel을 저장한다. Feature 색은 채널별 표시용 normalization이며 물리량이 아니다.
+
+Network format은 `elite_official_mgpm_scratch_v2`다. 이전 재구현 checkpoint를 resume하지
+않고 새 experiment에서 학습한다. 예: repo root에서
+`CUDA_VISIBLE_DEVICES=2 python lessons/elite/08_train_avatar.py --experiment elite_original`.
+학습 objective와 전처리는 이번 single-person lesson의 설정이다. Source의 저작권과
+라이선스 원문은 `ELITE_NETWORK_LICENSES.txt`에 보관한다.
 
 ## 07: 어떤 관측이 어떤 loss를 만드는가
 
@@ -753,6 +1245,35 @@ Tracking, FLAME, UV lookup, 입력 UV, LPIPS weight는 고정이다.
 기록한다. 1000 step마다 validation의 최대 16 frame을 보고 foreground PSNR로 `best.pt`를
 선택한다. 이는 모델 선택에 이용한 validation이며 독립 test set으로 부르지 않는다.
 `latest.pt`에는 model/optimizer/scheduler/RNG/config/data/code hash가 포함된다.
+
+학습 동향은 고정 frame preview로 더 자주 확인한다. 기본 `preview_every=100`이며 학습 전
+step 0, 매 100 step, 마지막 step에 같은 frame을 렌더링한다. `preview_frames=[]`이면 첫
+train frame과 첫 validation frame을 자동 선택한다. 현재 person/full은 frame 0과 32다.
+특정 frame 하나만 보려면 `"preview_frames": [0]`, 간격을 바꾸려면 `preview_every`를
+설정한다. 최대 4 frame이고, `preview_every=0`이면 끈다. 전체 validation은 기존 간격을 유지한다.
+
+Preview는 항상 `model.eval()`/`no_grad()`, 동일 camera, 흰 배경으로 계산한다. 완료 후
+원래 train 모드를 복구하며 optimizer 업데이트는 하지 않는다. 학습 frame과 validation
+frame은 이미지 header에서 구분하고 preview 점수로 best checkpoint를 선택하지 않는다.
+
+```text
+outputs/08/person/full/<experiment>/preview/
+  0.jpg                   # 학습 전 초기 상태
+  100.jpg                 # 100번째 업데이트 후
+  200.jpg
+  300.jpg
+  ...
+```
+
+각 이미지는 고정 frame들을 세로로 연결하고 reference | render | absolute error x4 열을
+유지한다. Preview에는 step 이름의 비교 이미지 한 장씩만 저장한다. 렌더링 결과는
+network가 random 초기화된 step 0에서 회색일 수 있으며, 고정 frame의 변화와 지표를
+시간에 따라 확인한다. 현재 실행 중인 프로세스에는 새 preview 코드가 자동으로 적용되지
+않는다. 코드를 보강한 뒤 처음부터 시작하려면 새 experiment를 사용한다.
+
+```bash
+CUDA_VISIBLE_DEVICES=2 python 08_train_avatar.py --experiment avatar_progress
+```
 
 ```bash
 CUDA_VISIBLE_DEVICES=2 python 08_train_avatar.py --experiment avatar --resume
@@ -796,6 +1317,11 @@ consecutive-frame temporal residual을 구한다. `--split validation`이면 hel
 `metrics.json`, `frames.csv`, `metric_curves.png`, `learning_curves.png`, 최악 8 frame의
 reference/render/error를 저장한다.
 
+연결만 먼저 확인할 때는 `--max-frames 40`으로 선택 split의 앞 40 frame만 평가한다.
+이 report는 전체 평가가 아니며 `metrics.json`의 `evaluated_frames`, `selected_split_frames`,
+`evaluation_complete`로 범위를 기록한다. 출력 폴더에 `_first40`을 붙여 전체 report와
+구분한다. 기본값 0에서는 기존처럼 선택 split 전체를 평가한다.
+
 Foreground PSNR은 target soft head alpha로 RGB squared error를 가중한다. Full-image PSNR은
 큰 흰 배경의 영향을 받으므로 둘을 함께 본다. Temporal residual은 렌더 변화에서 실제 RGB
 변화를 뺀 값이며 optical flow 정렬을 한 flicker metric은 아니다. 입/눈/옆얼굴/머리카락은
@@ -806,12 +1332,12 @@ Foreground PSNR은 target soft head alpha로 RGB squared error를 가중한다. 
 | 항목 | 이번 구현 |
 |---|---|
 | 데이터/prior | 한 identity의 train frame으로 처음부터 학습. 다인물 pretrained MGPM 미사용 |
-| Network | Driving/Song U-Net/두 6-level head와 conditioning/attention 경로 구현. 기본 PyTorch parameter layout/초기화이며 공개 state_dict 비호환 |
+| Network | 공식 ExprEncoder/SongUNet/두 UNetWBConcat의 learned 연산과 초기화/state_dict layout 보존. 한 파일로 이동하고 lesson 입출력만 연결 |
 | Geometry UV 통계 | 한 identity의 valid XYZ per-channel mean/std. 공개 population statistics 미사용 |
 | Texture | train RGB를 개인 tracking mesh로 visibility-aware fusion. 조명 포함 관측 색이며 VHAP fitted albedo와 다름 |
 | UV rasterizer | NVDiffrast face lookup + 직접 pixel-center barycentric 계산. 공식 PyTorch3D UV rasterization과 좌표 convention을 분리 |
 | Decoding | Coarse/fine TBN displacement, 두 축 scale, local quaternion, RGB, opacity 포함. Opacity는 안정적인 sigmoid [0,1] 사용 |
-| 초기화 | UV-dependent scale bias와 작은 nonzero output gain. 첫 단계의 너무 작은 splat을 피하기 위한 scratch 초기화 |
+| 초기화 | 06/08은 원본 network 초기화 그대로. 05의 수동 Gaussian 배치 예제에만 시각화용 scale 초기값 사용 |
 | Loss | 공개 personalization의 RGB/LPIPS/alpha/TV/normal/distortion에 SSIM와 약한 UV color/displacement prior 추가. RGB compositing과 normal normalization 명시 |
 | Optimizer | 전체 network AdamW + warmup/cosine. 공개 pretrained prior personalization optimizer와 구분 |
 | 생성 supervision/enhancer | 사용자 요청에 따라 제외 |
@@ -820,9 +1346,15 @@ Foreground PSNR은 target soft head alpha로 RGB squared error를 가중한다. 
 학습하는 것**이다. 논문의 전체 prior 학습/개인화/생성 adaptation 및 보고된 성능을 동일하게
 재현한 구현이라고 주장하지 않는다. 논문과의 구조/학습 차이가 필요한 비교 실험에서 중요하다.
 
-Agent 검증 범위는 Python syntax, split disjointness/gap, network skip channel schedule,
-scale inverse 식, pinned renderer API다. 사용자 환경의 CUDA backward, pretrained LPIPS
-download, network 학습, 영상/품질 평가는 사용자가 위 명령으로 확인해야 한다.
+GPU 2번(H200)에서 UV 512×512의 원본 network 비교를 수행했다. 초기 state가 정확히
+같았고 eval/train 출력의 최대 차이는 0이었다. 476개 학습 parameter 및 입력 UV/driving의
+gradient 비교도 통과했다. 원본에서 가져온 19개 function/class의 실행 AST도 일치했다.
+실제 1024×702 프레임으로 LPIPS를 포함한 loss, CUDA renderer backward, optimizer 한
+step을 확인했고 loss는 2.52669에서 2.52177로 내려갔다. Geometry/appearance map과 모든
+network 모듈에 유한한 nonzero gradient가 전달되었고 421개 parameter tensor가 갱신되었다.
+최대 GPU 할당 메모리는 약 4.90 GiB였다. 결과는 06 output의 `network_parity.json`과
+`training_step_check.json`에 기록했다. 전체 학습의 수렴, 영상 품질, held-out 일반화는
+아직 검증하지 않았다.
 
 ## 확인한 원본
 
