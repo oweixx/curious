@@ -1290,10 +1290,45 @@ Resume은 같은 config/data/code에 한정한다. 설정 또는 코드를 바�
 CUDA_VISIBLE_DEVICES=2 python 09_render_animation.py --experiment avatar
 ```
 
-기본은 `best.pt`를 사용한다. 전체 입력 sequence를 렌더링하고 `rgb.mp4`, `comparison.mp4`를
-만든다. Comparison은 **reference / render / absolute error x4**다. 25 frame 간격으로
-alpha/normal/float depth와 UV Gaussian map을 저장한다. 실제 값은 tensor/NPY이고 PNG는
-시각화다. 처음 몇 frame만 확인하려면 `--max-frames 8 --name first_preview`를 사용한다.
+기본은 `best.pt`를 사용한다. 전체 입력 sequence의 **모든 frame**으로 아래 영상을 만든다.
+
+| 영상 | 보여주는 값 |
+| --- | --- |
+| `rgb.mp4` | Reconstruction RGB |
+| `comparison.mp4` | reference / render / absolute error x4 |
+| `alpha.mp4` | Rasterizer의 누적 alpha, 검정=0 / 흰색=1 |
+| `depth.mp4` | Median camera depth, 가까움=밝음 / 멂=어두움 / 배경=검정 |
+| `normal.mp4` | World-space rendered normal, XYZ를 RGB로 표시 |
+| `gaussian_uv_raw.mp4` | Network가 출력한 geometry 13 + appearance 3채널의 4×4 패널 |
+| `gaussian_uv_decoded.mp4` | Decode 후 color, world XYZ, local displacement, world normal, 두 축 scale, opacity, fine displacement |
+
+**UV 격자의 대응 관계는 고정되어 있고, 각 texel의 파라미터 값이 바뀐다.**
+
+Raw 영상의 16채널은 SongUNet의 중간 feature 16채널이 아니라, 두 head의 최종 출력 **13+3채널**이다.
+부호색은 파랑=음수 / 흰색=0 / 빨강=양수다. 큰 raw 값도 표시하기 위해 `tanh(raw)`를
+사용하며, 이 변환은 영상에만 적용한다. 실제 decode에는 원래 network 출력이 들어간다.
+Decoded 영상에서 local displacement의 채널은 world XYZ가 아니라 **T/B/N**이다.
+Position/normal의 RGB 역시 texture 색이 아니라 3D 벡터의 표시다. Invalid UV 영역은 회색이다.
+
+Depth 영상은 모든 frame의 foreground(alpha>0.05, 유한한 양수 depth)에서 구한 각 frame의
+1~99 percentile 범위를 합쳐 **영상 전체에 동일한 거리 범위**를 사용한다. 표시 범위 밖의
+값은 clip한다. 필요하면 `--depth-range 0.8 1.2`처럼 고정 범위를 직접 지정할 수 있다.
+World XYZ 표시 범위도 전체 posed base mesh의 bounds에 0.03 FLAME world unit의 여유를
+추가해 고정한다. 큰 displacement가 이 범위를 넘으면 표시 색이 clip될 수 있다.
+범위와 좌표계는 `render.json`에 기록한다.
+
+영상에 사용한 PNG는 각 영상 이름의 폴더에 연속 frame 번호로 저장한다. 원본 float depth
+NPY와 decoded UV tensor, raw `network_output.pt`는 기본 **25 frame 간격**으로만 저장한다.
+`--save-aux-every`는 이 원본 dump 간격이며 영상의 frame 수에는 영향을 주지 않는다.
+Depth 표시를 위한 임시 float cache는 완료 후 삭제한다. UV 영상의 패널은 기본 256px이고
+`--uv-video-size`로 변경할 수 있다. 학습 UV 해상도는 바뀌지 않는다.
+
+처음 몇 frame만 확인하려면 `--max-frames 8 --name first_preview`를 사용한다. 기존 출력
+폴더는 덮어쓰지 않으므로, 이미 실행했다면 새 `--name`을 지정한다.
+
+```bash
+CUDA_VISIBLE_DEVICES=2 python 09_render_animation.py --experiment avatar --name reconstruction_videos
+```
 
 다른 영상도 01~03으로 tracking했다면 그 `scene.pt`를 driving으로 사용할 수 있다.
 
@@ -1305,6 +1340,8 @@ Target UV/identity를 유지하고 expression/pose만 교체한다. 다른 camer
 translation 평균 차이를 target train 평균으로 이동한다. 새 driver의 rotation range,
 expression scale, neck motion이 train 분포와 다른 경우 retargeting 품질은 별도 확인한다.
 공식 NeRF export/논문 외부 motion NPZ를 raw space scene.pt처럼 바로 받지는 않는다.
+다른 driver의 원본 영상과 target identity를 직접 비교할 수 없으므로 이 모드에서는
+`comparison.mp4`를 제외한 6개 영상을 만든다.
 
 ## 10: 좋게 보이는 frame만 평가하지 않기
 

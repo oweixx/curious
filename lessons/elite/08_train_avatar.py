@@ -210,7 +210,7 @@ def save_preview(model,surface,dataset,loss,ids,device,out,completed):
     temporary=path.with_suffix(".tmp")
     montage.save(temporary,format="JPEG",quality=92)
     temporary.replace(path)
-    print(f"preview {completed}: fixed frames={ids} foreground PSNR={report['mean']['foreground_psnr']:.3f} | {path}",flush=True)
+    print(f"preview {completed}: fixed frames={ids} foreground PSNR={report['mean']['foreground_psnr']:.3f}",flush=True)
 
 
 def main():

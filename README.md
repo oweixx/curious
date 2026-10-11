@@ -21,7 +21,7 @@
   - [X] Tracking Result → Canonical UV (4)
   - [X] UV represent → Gaussian Map (5)
   - [X] Gaussian Map → Avatar (6, 7, 8)
-  - [ ] Animation & Eval (9, 10)
+  - [X] Animation & Eval (9, 10)
 - [ELITE (CVPR 2026)](https://arxiv.org/abs/2601.10200)
 
 </div>
