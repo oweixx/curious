@@ -27,6 +27,21 @@
 </div>
 </details>
 
+<details>
+<summary>FiCA (26/10/17 ~ )</summary>
+<div markdown="1">
+
+- 
+  - [] Prepare dataset (NeRSemble)
+  - [] Extract partial uv map
+  - [] UV Texture / Geometry Diffusion
+  - [] UV Refine Network
+  - [] Gaussian Avatar Training
+- [FiCA (arXiv 2026)](https://arxiv.org/pdf/2606.24232)
+
+</div>
+</details>
+
 ---
 ### TODO
 - 3D Reconstruction using 2D Prior

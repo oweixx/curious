@@ -1,0 +1,9 @@
+# 코드/설명/설정만 Git으로 관리한다.
+/.cache/
+/data/
+/outputs/
+/checkpoints/
+/external/
+*.mp4
+*.pth
+*.safetensors

@@ -1,0 +1,12 @@
+# 현재 elite conda에서 검증한 Python dependency. Torch/CUDA는 기존 환경을 유지한다.
+numpy==1.23.1
+Pillow==12.3.0
+diffusers==0.25.1
+transformers==4.38.0
+huggingface-hub==0.25.1
+accelerate==0.31.0
+safetensors==0.5.3
+einops==0.8.1
+lpips==0.1.4
+ninja==1.11.1.4
+# CUDA extension 설치 명령과 Torch 버전은 GUIDE.md에 있다.

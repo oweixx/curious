@@ -1,0 +1,307 @@
+"""04 — Identity hypernetwork + driving decoder로 실제 3D Gaussian avatar를 학습한다.
+
+읽는 순서: IdentityEncoder -> GaussianDecoder -> UniversalPrior -> decode -> render.
+Identity bias pyramid는 매 decoder layer에 더한다(FiCA 3.3 / URAvatar Fig.3).
+Private expression encoder 대신 FLAME100->256 adapter를 학습한다. Geometry branch는
+표정의 guide mesh를 학습하며 GT posed mesh를 Gaussian anchor로 몰래 넣지 않는다.
+Guide mesh supervision/normal/Laplacian을 사용하여 RGB만 맞추는 퇴화를 점검한다.
+
+CUDA_VISIBLE_DEVICES=0 python 04_gaussian_avatar.py --stage train
+CUDA_VISIBLE_DEVICES=0 python 04_gaussian_avatar.py --stage render --identity-source refined
+FiCA의 RGB UPM을 대상으로 하며 URAvatar의 조명/반사/별도 안구 모듈을 주장하지 않는다.
+"""
+
+import importlib.util
+import math
+from pathlib import Path
+import subprocess
+
+import torch
+from torch import nn
+import torch.nn.functional as F
+
+spec = importlib.util.spec_from_file_location("fica_00", Path(__file__).with_name("00_prepare_nersemble.py"))
+L00 = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(L00)
+
+
+class IdentityEncoder(nn.Module):
+    """UV texture+geometry -> decoder의 각 해상도에서 쓸 untied bias maps.
+
+    U-Net skip은 identity encoder 내부에 있다. ID bias를 1D embedding 하나로 대체하지 않는다.
+    공개 안 된 채널 수는 config에서 명시한다. 해상도 4->U의 모든 단계를 유지한다.
+    """
+    def __init__(self, channels):
+        super().__init__()
+        widths = list(reversed(channels))
+        self.stem = nn.Conv2d(6, widths[0], 3, padding=1)
+        self.down = nn.ModuleList([nn.Sequential(nn.Conv2d(a,b,4,2,1),nn.LeakyReLU(.2)) for a,b in zip(widths,widths[1:])])
+        self.up = nn.ModuleList()
+        self.fuse = nn.ModuleList()
+        incoming = widths[-1]
+        for width in channels:
+            self.up.append(nn.ConvTranspose2d(incoming, width, 4, 2, 1))
+            self.fuse.append(nn.Conv2d(width*2, width, 3, padding=1))
+            incoming = width
+        self.bias_geo = nn.ModuleList([nn.Conv2d(c,c,1) for c in channels])
+        self.bias_app = nn.ModuleList([nn.Conv2d(c,c,1) for c in channels])
+
+    def forward(self, uv):
+        features = [F.leaky_relu(self.stem(uv), .2)]
+        for block in self.down:
+            features.append(block(features[-1]))
+        current = F.adaptive_avg_pool2d(features[-1], (4,4))
+        pyramid = []
+        for up, fuse, skip in zip(self.up, self.fuse, reversed(features)):
+            current = F.leaky_relu(up(current), .2)
+            skip = F.interpolate(skip, size=current.shape[-2:], mode="bilinear", align_corners=False)
+            current = F.leaky_relu(fuse(torch.cat((current,skip),1)), .2)
+            pyramid.append(current)
+        return {"geometry": [layer(x) for layer,x in zip(self.bias_geo,pyramid)],
+                "appearance": [layer(x) for layer,x in zip(self.bias_app,pyramid)]}
+
+
+class GaussianDecoder(nn.Module):
+    def __init__(self, channels, driving_dim, output_channels):
+        super().__init__()
+        self.seed = nn.Sequential(nn.Linear(driving_dim,256),nn.LeakyReLU(.2),nn.Linear(256,channels[0]*4*4))
+        self.blocks = nn.ModuleList()
+        incoming = channels[0]
+        for width in channels:
+            self.blocks.append(nn.ConvTranspose2d(incoming,width,4,2,1))
+            incoming = width
+        self.output = nn.Conv2d(channels[-1],output_channels,1)
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+        self.seed_channels = channels[0]
+
+    def forward(self, driving, biases):
+        x = self.seed(driving).reshape(-1,self.seed_channels,4,4)
+        for block,bias in zip(self.blocks,biases):
+            x = F.leaky_relu(block(x)+bias,.2)
+        return self.output(x)
+
+
+class UniversalPrior(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        settings = config["upm"]
+        channels, expression_dim = settings["channels"], settings["expression_dim"]
+        if 4*2**len(channels) != config["uv_size"]:
+            raise ValueError("UPM channels 수는 4->UV size의 upsample 수여야 한다.")
+        self.identity_encoder = IdentityEncoder(channels)
+        self.expression_adapter = nn.Sequential(nn.Linear(100,256),nn.LeakyReLU(.2),nn.Linear(256,expression_dim))
+        # Neck/gaze는 geometry, view는 appearance에만 전달한다.
+        self.geometry_decoder = GaussianDecoder(channels, expression_dim+3+6,13)
+        self.appearance_decoder = GaussianDecoder(channels, expression_dim+3+6+3,4)
+        self.max_offset = settings["max_offset"]
+
+    def encode_identity(self, texture, xyz, mean, std):
+        return self.identity_encoder(torch.cat((texture*2-1,(xyz-mean)/std),1))
+
+    def forward(self, texture, xyz, mean, std, expression, neck, gaze, view, biases=None):
+        biases = self.encode_identity(texture,xyz,mean,std) if biases is None else biases
+        e = self.expression_adapter(expression)
+        driving = torch.cat((e,neck,gaze),-1)
+        geometry = self.geometry_decoder(driving,biases["geometry"])
+        appearance = self.appearance_decoder(torch.cat((driving,view),-1),biases["appearance"])
+        # Guide offsets와 Gaussian residual을 분리해 guide를 직접 감독한다.
+        return {"guide":xyz+.2*geometry[:,:3].tanh(), "offset":self.max_offset*geometry[:,3:6].tanh(),
+                "quaternion_residual":geometry[:,6:10], "scale_raw":geometry[:,10:13],
+                "color_offset":appearance[:,:3], "opacity_logit":appearance[:,3:4], "biases":biases}
+
+
+def driving(sample):
+    q = L00.elite(5).axis_angle_to_quaternion(sample["eyes_pose"].reshape(2,3))
+    rotations = L00.elite(5).quaternion_matrix(q)
+    gaze = rotations[:,:,2].reshape(1,6)
+    camera = torch.linalg.inv(sample["w2c"])[:3,3]
+    view = F.normalize(camera-sample["global_translation"],dim=0)
+    # View direction을 head-local 좌표계로 옮겨 global pose에 대한 appearance를 학습한다.
+    view = (view @ sample["global_rotation"])[None]
+    return sample["expression"][None],sample["neck_pose"][None],gaze,view
+
+
+def decode(raw, texture, bridge, sample, config):
+    """고정 parameter 해석. 3축 scale, wxyz rotation, sigmoid opacity.
+
+    Gaussians는 learned guide에 배치한다. Camera/root pose만 외부 tracking에서 얻는다.
+    """
+    l05 = L00.elite(5)
+    guide = bridge(raw["guide"][0].float())
+    points = bridge.vertices_to_uv(guide).permute(1,2,0).reshape(-1,3)[bridge.indices]
+    # UV triangle의 T/B/N. Canonical guide의 deformation에 따라 방향이 갱신된다.
+    frames, bad = L00.elite(4).face_tbn(guide[None],bridge.vt,bridge.faces,bridge.ft)
+    basis = frames[0,bridge.face[bridge.valid]]
+    def take(value):
+        return value[0].float().permute(1,2,0).reshape(-1,value.shape[1])[bridge.indices]
+    position = points+(basis@take(raw["offset"])[...,None]).squeeze(-1)
+    residual = take(raw["quaternion_residual"])
+    identity_q = torch.zeros_like(residual);identity_q[:,3]=1
+    local_q = F.normalize(identity_q+residual,dim=-1)
+    local_q = torch.where((local_q.norm(dim=-1)<1e-6)[:,None],identity_q,local_q)
+    rotation = sample["global_rotation"][None]@basis@l05.quaternion_matrix(local_q)
+    scale = (.0006*512/config["uv_size"])*torch.exp(take(raw["scale_raw"]).clamp(-6,3))
+    # 초기 normal 방향의 얇은 3D ellipsoid. 2DGS의 2축 scale과 다르다.
+    scale = scale*scale.new_tensor([1.,1.,.2])
+    color = (take(texture)+take(raw["color_offset"])).clamp(0,1)
+    return {"position":position@sample["global_rotation"].T+sample["global_translation"],
+            "rotation":l05.matrix_quaternion(rotation),"scale":scale,
+            "opacity":take(raw["opacity_logit"]).sigmoid(),"color":color,
+            "normal":rotation[:,:,2],"guide_vertices":guide,"offset":take(raw["offset"])}
+
+
+def render(gaussians, sample, background):
+    """Graphdeco의 실제 3DGS backend. 2DGS rasterizer를 3DGS로 부르지 않는다."""
+    from diff_gaussian_rasterization import GaussianRasterizer,GaussianRasterizationSettings
+    h,w = sample["rgb"].shape[-2:]
+    view,projection,center = L00.elite(5).camera_matrices(sample["K"],sample["w2c"],h,w)
+    def raster(colors,bg):
+        settings=GaussianRasterizationSettings(image_height=h,image_width=w,
+            tanfovx=float(w/(2*sample["K"][0,0])),tanfovy=float(h/(2*sample["K"][1,1])),bg=bg,
+            scale_modifier=1.,viewmatrix=view,projmatrix=projection,sh_degree=0,campos=center,prefiltered=False,debug=False)
+        points=gaussians["position"].contiguous()
+        screen=torch.zeros_like(points,requires_grad=torch.is_grad_enabled())
+        result=GaussianRasterizer(settings)(means3D=points,means2D=screen,shs=None,
+            colors_precomp=colors.contiguous(),opacities=gaussians["opacity"].contiguous(),
+            scales=gaussians["scale"].contiguous(),rotations=gaussians["rotation"].contiguous(),cov3D_precomp=None)
+        return result[0],result[1]
+    rgb,radii=raster(gaussians["color"],background)
+    alpha,_=raster(torch.ones_like(gaussians["color"]),torch.zeros_like(background))
+    normal,_=raster(gaussians["normal"]*.5+.5,torch.zeros_like(background))
+    normal=F.normalize(normal/alpha.clamp_min(1e-6)*2-1,dim=0)
+    camera=gaussians["position"]@sample["w2c"][:3,:3].T+sample["w2c"][:3,3]
+    depth,_=raster((-camera[:,2:3]).expand(-1,3),torch.zeros_like(background))
+    depth=depth[:1]/alpha[:1].clamp_min(1e-6)
+    return {"rgb":rgb,"alpha":alpha[:1],"normal":normal,"depth":depth,"radii":radii}
+
+
+def avatar_loss(config, rendered, gaussians, sample, bridge, perceptual=None):
+    settings=config["upm"]
+    target_alpha=sample["alpha"]
+    expected=sample["rgb"] if sample.get("rgb_composited_white",False) else sample["rgb"]*target_alpha+1-target_alpha
+    guide=gaussians["guide_vertices"]
+    target=sample["local_vertices"]
+    # Guide geometry와 실제 Gaussian 방향을 모두 감독한다. RGB만 좋아지는 퇴화를 점검한다.
+    guide_normal=L00.vertex_normals(guide,bridge.faces)
+    target_normal=L00.vertex_normals(target,bridge.faces)
+    geometry_scale=target.std(dim=0).clamp_min(.01).detach()
+    geometry=((guide-target)/geometry_scale).square().mean()
+    normal=(1-(guide_normal*target_normal).sum(-1)).mean()
+    valid=sample["labels"]["valid"].float()*rendered["alpha"].detach()
+    normal=normal+((1-(rendered["normal"]*sample["labels"]["normal_world"]).sum(0,keepdim=True))*valid).sum()/valid.sum().clamp_min(1)
+    laplacian=((L00.mesh_laplacian(guide,bridge.faces)-L00.mesh_laplacian(target,bridge.faces))/geometry_scale).square().mean()
+    lpips=rendered["rgb"].sum()*0 if perceptual is None else perceptual(rendered["rgb"][None]*2-1,expected[None]*2-1).mean()
+    terms={"photo":F.l1_loss(rendered["rgb"],expected),"mask":F.l1_loss(rendered["alpha"],target_alpha),
+           "lpips":lpips,"geometry":geometry,"normal":normal,"laplacian":laplacian,"offset":gaussians["offset"].square().mean()}
+    return sum(value*settings[name] for name,value in terms.items()),terms
+
+
+def identity_input(data,row,device,source="target"):
+    identity=data.identity(row["identity"],device)
+    if source=="target":
+        return identity["texture"][None],identity["xyz"][None]
+    if source not in ("generated","refined"):
+        raise ValueError(source)
+    value=L00.load_tensor(data.path/source/f"{Path(row['file']).stem}.pt",device)
+    return value["texture"][None],value["xyz"][None]
+
+
+def train(config,data,device,steps,perceptual=True,resume=False):
+    model=UniversalPrior(config).to(device).train()
+    optimizer=torch.optim.AdamW(model.parameters(),lr=config["upm"]["lr"])
+    loss_network=None
+    if perceptual:
+        import lpips
+        loss_network=lpips.LPIPS(net="vgg").to(device).eval().requires_grad_(False)
+    mean,std=L00.lesson(3).stats(data,device)
+    bridges={}
+    rows=data.samples("train")
+    start=L00.training_start(L00.work_root(config)/"checkpoints/04/latest.pt",model,optimizer,config,data,resume)
+    accumulation=config["training"]["grad_accumulation"]
+    for step in range(start,steps):
+        optimizer.zero_grad(set_to_none=True)
+        mean_loss=0.;mean_terms={}
+        for micro in range(accumulation):
+            row=data.training_row()
+            if row["identity"] not in bridges:
+                bridges[row["identity"]]=data.bridge(row["identity"],device)
+            bridge=bridges[row["identity"]]
+            sample=data.sample(row,device)
+            texture,xyz=identity_input(data,row,device,"target")
+            with torch.autocast("cuda",dtype=torch.bfloat16):
+                raw=model(texture,xyz,mean,std,*driving(sample))
+            gaussians=decode(raw,texture,bridge,sample,config)
+            rendered=render(gaussians,sample,torch.ones(3,device=device))
+            loss,terms=avatar_loss(config,rendered,gaussians,sample,bridge,loss_network)
+            (loss/accumulation).backward()
+            mean_loss+=float(loss.detach())/accumulation
+            for name,value in terms.items():
+                mean_terms[name]=mean_terms.get(name,0.)+float(value.detach())/accumulation
+        report=L00.gradients(model)
+        torch.nn.utils.clip_grad_norm_(model.parameters(),config["training"]["clip_grad"])
+        optimizer.step()
+        L00.append_log(L00.work_root(config)/"outputs/04/training.jsonl",{"step":step+1,"loss":mean_loss,"terms":mean_terms,"gradient":report})
+        print(f"04 step {step+1}/{steps}: {mean_loss:.6f}",flush=True)
+        if (step+1)%config["training"]["preview_every"]==0 or step==0:
+            L00.save_panels(L00.work_root(config)/"outputs/04/preview"/f"{step+1}.jpg",[sample["rgb"],rendered["rgb"],rendered["normal"]*.5+.5,rendered["alpha"]],
+                            ["Reference","3DGS render","World normal","Alpha"])
+        if (step+1)%config["training"]["checkpoint_every"]==0 or step==steps-1:
+            L00.checkpoint(L00.work_root(config)/"checkpoints/04/latest.pt",model,optimizer,config,data,step+1)
+    return model.eval()
+
+
+@torch.no_grad()
+def render_sequence(config,data,model,device,source="refined",portrait_frame=None):
+    mean,std=L00.lesson(3).stats(data,device)
+    bridges={}
+    references={}
+    for row in data.manifest["samples"]:
+        if row["identity"] not in references and (portrait_frame is None or row["frame"]==portrait_frame):
+            references[row["identity"]]=row
+    current_identity=None
+    out=L00.work_root(config)/"outputs/04"/source
+    for i,row in enumerate(data.manifest["samples"]):
+        if row["identity"] not in bridges:
+            bridges[row["identity"]]=data.bridge(row["identity"],device)
+        sample=data.sample(row,device)
+        if row["identity"] not in references:
+            raise ValueError(f"identity {row['identity']}에 portrait frame이 없다.")
+        reference=references[row["identity"]]
+        if current_identity!=row["identity"]:
+            # 한 portrait의 canonical identity UV/bias를 고정하고 driving만 바꾼다.
+            texture,xyz=identity_input(data,reference,device,source)
+            with torch.autocast("cuda",dtype=torch.bfloat16):
+                biases=model.encode_identity(texture,xyz,mean,std)
+            current_identity=row["identity"]
+        with torch.autocast("cuda",dtype=torch.bfloat16):
+            raw=model(texture,xyz,mean,std,*driving(sample),biases=biases)
+        gs=decode(raw,texture,bridges[row["identity"]],sample,config)
+        rendered=render(gs,sample,torch.ones(3,device=device))
+        L00.save_image(out/"rgb"/f"{i:06d}.png",rendered["rgb"])
+        L00.save_panels(out/f"{i:06d}.jpg",[sample["rgb"],rendered["rgb"],rendered["normal"]*.5+.5,rendered["alpha"]],
+                        ["Reference","Generated avatar","Normal","Alpha"])
+        L00.save_tensor(out/f"{i:06d}.pt",dict({k:v.cpu() for k,v in gs.items()},reference_frame=reference["file"],driver_frame=row["file"]))
+    L00.save_json(out/"render.json",{"identity_source":source,"fixed_portraits":{k:v["file"] for k,v in references.items()},
+        "frames":len(data.manifest["samples"]),"scope":"one fixed portrait per identity; frame driving/camera changes"})
+
+
+def main():
+    parser=L00.arguments(__doc__)
+    parser.add_argument("--stage",choices=("train","render"),default="train")
+    parser.add_argument("--identity-source",choices=("target","generated","refined"),default="refined")
+    parser.add_argument("--portrait-frame",type=int,help="identity마다 고정할 reference frame; 기본은 첫 frame")
+    args=parser.parse_args()
+    config=L00.read_config(args.config,args.smoke)
+    device=L00.setup_device(args.device,config["seed"])
+    data=L00.PreparedData(args.data)
+    if args.stage=="train":
+        train(config,data,device,args.steps or config["training"]["steps"],resume=args.resume)
+    else:
+        model=UniversalPrior(config).to(device).eval()
+        L00.restore(L00.work_root(config)/"checkpoints/04/latest.pt",model,config,data)
+        render_sequence(config,data,model,device,args.identity_source,args.portrait_frame)
+
+
+if __name__=="__main__":
+    main()
