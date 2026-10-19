@@ -207,7 +207,29 @@ def stage_generation(config,data,device):
     module=L00.lesson(2)
     module.build_cache(data,device,"predicted")
     clear()
-    model=module.train(config,data,device,4)
+    model=module.train(config,data,device,4,val_every=2,val_sample_steps=4)
+    validation=L00.work_root(config)/"outputs/02/validation"
+    assert all((validation/f"{step}.jpg").is_file() for step in (0,2,4))
+    validation_log=[json.loads(line) for line in (validation/"metrics.jsonl").read_text().splitlines()][-3:]
+    assert [row["step"] for row in validation_log]==[0,2,4]
+    assert all(row["frames"]==[data.samples("validation")[0]["file"]] for row in validation_log)
+    assert all(row["seed"]==config["seed"] and row["sample_steps"]==4 for row in validation_log)
+    # 평가가 학습 RNG와 mode를 바꾸지 않고, 같은 weight/noise로 같은 지표를 내는지 확인한다.
+    import nvdiffrast.torch as dr
+    with torch.random.fork_rng(devices=[device]):
+        conditioners=module.FrozenConditioners(data,device,load_clip=False)
+    context=dr.RasterizeCudaContext(device=device)
+    model.train()
+    model.zero_grad(set_to_none=True)
+    rng_cpu,rng_cuda=torch.get_rng_state().clone(),torch.cuda.get_rng_state(device).clone()
+    repeated=module.validate(config,data,model,device,conditioners,context,module.validation_rows(data,1),
+                             L00.work_root(config)/"outputs/02/repeat_check",4,4)
+    assert model.training and all(p.grad is None for p in model.parameters())
+    assert torch.equal(rng_cpu,torch.get_rng_state()) and torch.equal(rng_cuda,torch.cuda.get_rng_state(device))
+    for name in ("flow_loss","texture_l1","xyz_rmse"):
+        assert abs(repeated[name]-validation_log[-1][name])<1e-6,(name,repeated[name],validation_log[-1][name])
+    model.eval()
+    del conditioners,context
     cache=module.read_cache(data,data.samples("train")[0],device)
     with torch.no_grad():
         latent=torch.randn(1,*cache["texture"].shape,device=device)
@@ -223,7 +245,9 @@ def stage_generation(config,data,device):
     module.generate(config,data,model,device,steps=4)
     result={"train_steps":4,"sample_steps":4,"actual_external_weights":["SDXL VAE","CLIP ViT-L/14"],
             "control_effect_max":control_effect,"checkpoint_roundtrip":True,"predicted_partial_used":True,
-            "parameters":sum(p.numel() for p in model.parameters()),"profile":"small DiT; full paper depth stays in fica_config.json"}
+            "parameters":sum(p.numel() for p in model.parameters()),"profile":"small DiT; full paper depth stays in fica_config.json",
+            "validation_steps":[0,2,4],"fixed_heldout_frame_and_seed":True,
+            "validation_rng_and_mode_preserved":True,"validation_deterministic":True}
     del model,clone
     clear()
     return result

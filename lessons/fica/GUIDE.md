@@ -358,6 +358,31 @@ CUDA_VISIBLE_DEVICES=0 python 02_generate_uv.py --stage train
 CUDA_VISIBLE_DEVICES=0 python 02_generate_uv.py --stage sample
 ```
 
+학습 화면은 **tqdm bar 하나에 train loss와 최근 validation flow loss**를 표시한다.
+상세 gradient는 `outputs/02/training.jsonl`에만 기록한다. 시작 시점과 **100 optimizer
+step마다**, 그리고 마지막 step에 고정 validation을 저장한다. 이미지 경로는
+`outputs/02/validation/0.jpg`, `100.jpg`, `200.jpg`, … 이며 step별 폴더는 만들지 않는다.
+
+기본 validation은 항상 첫 번째 held-out frame을 사용한다. Reference/partial UV와
+noise seed를 고정하고, 기본 50-step Euler sampling을 수행한다. 한 장의 비교 이미지에
+입력 사진·partial RGB·visibility, target/generated texture와 오차, target/generated XYZ와
+오차, 두 mesh render, texture supervision mask를 배치한다. Target은 00에서 만든
+pseudo target이며 미관측 texture를 정답으로 취급하지 않는다. 사진은 종횡비를 유지하고,
+XYZ 표시와 error 색 범위도 모든 step에서 고정한다.
+
+`validation/metrics.jsonl`에는 고정 noise와 `t=0.5`에서의 flow loss, 관측된 target
+texel의 RGB L1, valid UV의 XYZ Euclidean RMSE(world 단위)를 기록한다. RGB/XYZ 지표는
+sampling을 완료하고 VAE로 decode한 결과의 오차이므로 flow loss와 구분한다. RGB는
+표시할 때만 [0,1]로 clip하고 지표는 원래 예측값으로 계산한다. Validation은 optimizer를
+갱신하지 않으며 train/eval mode와 학습 RNG를 복원한다.
+
+간격·평가 frame 수·sampling 비용은 다음처럼 지정할 수 있다. `--val-frames 0`은
+전체 held-out frame의 지표를 평균내며, JPEG에는 같은 첫 frame을 계속 표시한다.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python 02_generate_uv.py --stage train --val-every 100 --val-frames 1 --val-sample-steps 50
+```
+
 `cache`는 실제 SDXL VAE/CLIP을 사용한다. Partial의 RGB/mask/normal/XYZ를 각각 VAE에 넣고
 latent를 이어 ControlMLP에 전달한다. `--partial-source gt_correspondence`는 별도 oracle
 ablation이며 기본값은 항상 `predicted`다. 어떤 경로인지 cache와 학습 log에 남는다.

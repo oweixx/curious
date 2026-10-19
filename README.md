@@ -33,6 +33,7 @@
 
 - 기존 FLAME을 사용한다면 Partial uv map 예측은 필요 없어진다. 아마 FiCA의 dataset자체가 내부 multi-view iphone 촬영 데이터셋이기도 하고 그중에서도 single image로만 이용하기 때문에 기존에 Sapiens가 Foundation model로서 학습하던 것을 이용하여 partial uv map을 예측하게 fine-tune하게 된다.
 - 1에서 진행하는 것은 결국 FLAME을 쓰지 않고 대규모 데이터로 fine-tune된 Sapiens를 이용해서 Feed-Forward uv map 예측을 해보자 라는 것으로 해석된다. 그렇다 보니 이번에 진행한 한 명이라는 dataset으로 overfitting시킨다고 해도 novel pose에 대해서 깨지거나 점들이 번지는 현상이 보이고 있다. 결국 Meta에서 수행한 연구이기도 하고 내부에서 수집한 대규모 데이터셋을 통해서 학습 하기 때문에 이러한 Feed-Forward 작업이 가능한 것은 사실인 것 같다.
+- 2자체는 Partial UV Map을 이용하여 Canonical UV Map을 생성하는 부분이다. 이렇게 되면 안보이는 부분에 대한 texture를 일관성있게 생성해 낼 수 있기 때문에 이러한 부분이 2D UV Map에서의 장점이 되는 것 같다.
   - [X] Prepare dataset (NeRSemble)
   - [X] Extract partial uv map
   - [] UV Texture / Geometry Diffusion
@@ -94,7 +95,7 @@
     - [MATCH (CVPR 2026)](https://malteprinzler.github.io/projects/match/)
     - [MeGA (CVPR 2025)](https://conallwang.github.io/MeGA_Pages/)
     - [AnimPortrait3D (SIGGRAPH 2025)](https://onethousandwu.com/animportrait3d.github.io/)
-
+    - [Video Diffusion Avatars(Preprint 2026)](https://simongiebenhain.github.io/video-diffusion-avatars/)
 
 </div>
 </details>
