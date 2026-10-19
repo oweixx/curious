@@ -12,6 +12,7 @@ import gc
 import importlib.util
 import json
 import os
+import shutil
 from pathlib import Path
 import time
 
@@ -59,7 +60,9 @@ def stage_data(config, path, device):
 def stage_partial(config,data,device):
     module=L00.lesson(1)
     for task in ("uv","xyz","normal"):
-        module.train_task(config,data,task,device,steps=2,save=False)
+        module.train_task(config,data,task,device,steps=2,save=False,val_every=1)
+        out,_=module.run_paths(config,task)
+        assert all((out/"validation"/f"{step}.jpg").is_file() for step in (0,1,2))
         clear()
     module.compose_predictions(data,device)
     row=data.samples("train")[0]
@@ -70,7 +73,134 @@ def stage_partial(config,data,device):
     # 미학습 UV head가 망가져 visibility=0일 수도 있다. GT fallback으로 성공시키지 않는다.
     return {"tasks":["uv","xyz","normal"],"steps_each":2,"actual_encoder":"Sapiens-1B, 40 layers, 1536 channels",
             "pretrained_strict_load":True,"partial_shape":list(partial.shape),"observed_predicted_texels":int(partial[3].sum()),
+            "validation_steps_each":[0,1,2],"input_transform":module.INPUT_TRANSFORM,
             "fallback_to_gt":False,"quality":"two-step training is not a converged predictor"}
+
+
+
+
+def stage_repair(config, _data, device):
+    """실제 50K UV로 초기화하고 별도 cache에서 mask/joint/resume/추론을 검사한다.
+
+    Sapiens는 실제 1B, 입력만 smoke의 128x96이다. 사용자 학습 자료/가중치/
+    partial_pred는 읽기만 한다. 큰 임시 checkpoint는 검사 후 삭제한다.
+    """
+    import nvdiffrast.torch as dr
+    module = L00.lesson(1)
+    context = dr.RasterizeCudaContext(device=device)
+    # UV row 방향, source 좌표, bilinear sampling을 알려진 identity warp로 검사한다.
+    y,x=torch.meshgrid(torch.arange(32,device=device),torch.arange(32,device=device),indexing="ij")
+    u,v=(x+.5)/32,1-(y+.5)/32
+    uv=torch.stack((u,v)); rgb=torch.stack((u,1-v,u*0+.25))
+    normal=torch.zeros_like(rgb); normal[2]=1
+    valid=torch.ones(1,32,32,device=device,dtype=torch.bool)
+    partial,coverage,_=module.resample_partial_uv(rgb,uv,rgb,normal,valid,32,context,max_uv_edge=.1)
+    assert coverage[:,2:-2,2:-2].all()
+    warp_error=float((partial[:3,2:-2,2:-2]-rgb[:,2:-2,2:-2]).abs().max())
+    assert warp_error<1e-6
+    assert torch.allclose(partial[4:7,2:-2,2:-2],normal[:,2:-2,2:-2])
+    empty,_,_=module.resample_partial_uv(rgb,uv,rgb,normal,valid&False,32,context,max_uv_edge=.1)
+    assert not empty.any()
+    seam=uv.clone(); seam[0,:,:16]*=.5; seam[0,:,16:]=.5+seam[0,:,16:]*.5
+    _,seam_coverage,stats=module.resample_partial_uv(rgb,seam,rgb,normal,valid,32,context,max_uv_edge=.1)
+    assert stats["rejected_seam_cells"]>0 and not seam_coverage[:,:,10:22].any()
+    source=L00.ROOT/"data/prepared"
+    parent=L00.ROOT/"checkpoints/01/crop/uv.pt"
+    if not parent.exists():
+        raise FileNotFoundError("repair smoke는 기존 checkpoints/01/crop/uv.pt와 XYZ/normal export가 필요하다.")
+    destination=L00.CACHE/"smoke/repair_data"
+    destination.mkdir(parents=True,exist_ok=True)
+    shutil.copyfile(source/"manifest.json",destination/"manifest.json")
+    for name in ("frames","identities"):
+        link=destination/name
+        if not link.exists():
+            link.symlink_to((source/name).resolve(),target_is_directory=True)
+    (destination/"predictions").mkdir(exist_ok=True)
+    for name in ("xyz","normal"):
+        link=destination/"predictions"/name
+        if not link.exists():
+            link.symlink_to((source/"predictions"/name).resolve(),target_is_directory=True)
+    data=L00.PreparedData(destination)
+    run=f"repair_smoke_{time.time_ns()}"
+    module.train_uv_repair(config,data,device,steps=2,init_from=parent,run_name=run,val_every=1,val_frames=1)
+    out,path=module.run_paths(config,"uv",run)
+    assert all((out/"validation"/f"{step}.jpg").exists() for step in (0,1,2))
+    log=[json.loads(line) for line in (out/"training.jsonl").read_text().splitlines()]
+    assert [r["warmup"] for r in log]==[True,False]
+    assert log[0]["gradient"]["tensors"]==4 and log[1]["gradient"]["tensors"]>4
+    clone,metadata=module.load_predictor(path,"uv",config,data,device)
+    assert isinstance(clone,module.UVValidityPredictor) and metadata["source_step"]==2
+    row=data.samples("validation")[0]
+    sample=module.prepare_input(data.sample(row,device),clone.input_size)
+    clone.eval()
+    with torch.no_grad(),torch.autocast("cuda",dtype=torch.bfloat16):
+        predicted,logit=clone.predict(sample["rgb"][None])
+    assert predicted.dtype==torch.float32 and logit.dtype==torch.float32
+    y,x,h,w=[sample["crop"][k] for k in ("top","left","height","width")]
+    saved=L00.load_tensor(data.path/"predictions"/run/"uv"/f"{Path(row['file']).stem}.pt",device)
+    # AMP encoder의 CUDA 연산은 bitwise 재현을 보장하지 않는다. Weight는 정확히,
+    # 예측은 작은 수치 오차 허용 범위에서 검사한다.
+    reload_error=float((saved[:,y:y+h,x:x+w]-predicted[0]).abs().mean())
+    assert reload_error<1e-4
+    state=torch.load(path,map_location="cpu",mmap=True,weights_only=True)
+    for key in ("decode_head.conv_seg.weight","validity_head.0.weight","validity_head.2.weight"):
+        assert torch.equal(clone.state_dict()[key].cpu(),state["model"][key])
+    del state
+    del clone,predicted,logit,saved
+    clear()
+    # 동일 config/data/code에서 optimizer와 step을 실제로 복원해 한 step 더 학습한다.
+    module.train_uv_repair(config,data,device,steps=3,resume=True,run_name=run,val_every=1,val_frames=1)
+    # 비교 이미지도 smoke 경로에 쓴다. Disk manifest의 fingerprint는 그대로 유지한다.
+    data.manifest["config"]["profile"]="smoke"
+    module.compose_uv_repair(data,device,run,config["uv_repair"])
+    first=data.manifest["samples"][0]
+    output=data.path/"partial_pred"/f"{Path(first['file']).stem}.pt"
+    result=L00.load_tensor(output)
+    finite(result["partial"])
+    uv_size=data.manifest["config"]["uv_size"]
+    assert result["partial"].shape==(10,uv_size,uv_size) and not result["gt_used_for_prediction"]
+    # 3-step의 새 mask는 아직 비어 있다. GT 독립성 검사는 test cache의 confidence만
+    # 1로 설정해 nonempty 출력에서 수행한다. 실제 학습 품질로 사용하지 않는다.
+    probability_path=data.path/"predictions"/run/"validity"/f"{Path(first['file']).stem}.pt"
+    probability=L00.load_tensor(probability_path)
+    probability.fill_(1.)
+    L00.save_tensor(probability_path,probability)
+    original_rows=data.manifest["samples"]
+    data.manifest["samples"]=[first]
+    module.compose_uv_repair(data,device,run,config["uv_repair"])
+    before=L00.load_tensor(output)
+    assert before["partial"][3].sum()>0
+    original_sample=data.sample
+    def poisoned_labels(row,device="cpu"):
+        sample=original_sample(row,device)
+        return dict(sample,labels={k:torch.zeros_like(v) for k,v in sample["labels"].items()},partial_gt=torch.zeros_like(sample["partial_gt"]))
+    data.sample=poisoned_labels
+    module.compose_uv_repair(data,device,run,config["uv_repair"])
+    after=L00.load_tensor(output)
+    assert torch.equal(before["partial"],after["partial"])
+    data.sample=original_sample
+    data.manifest["samples"]=original_rows
+    # 02가 이전 partial의 latent를 재사용하지 못하는지도 확인한다.
+    cache_path=data.path/"latents"/f"{Path(first['file']).stem}.pt"
+    L00.save_tensor(cache_path,{"partial_source":"predicted","partial_sha256":L00.sha256(output)})
+    L00.lesson(2).read_cache(data,first,device)
+    L00.save_tensor(cache_path,{"partial_source":"predicted","partial_sha256":"stale"})
+    try:
+        L00.lesson(2).read_cache(data,first,device)
+    except ValueError:
+        stale_rejected=True
+    else:
+        raise AssertionError("stale partial cache를 거부하지 않았다.")
+    cache_path.unlink()
+    path.unlink()  # 이 테스트가 만든 약 13GB checkpoint만 제거한다.
+    return {"parent_checkpoint":str(parent),"actual_encoder":"Sapiens-1B","input_size":[128,96],
+            "identity_resampling_max_error":warp_error,"seam_not_bridged":True,
+            "warmup_gradient_tensors":log[0]["gradient"]["tensors"],
+            "joint_gradient_tensors":log[1]["gradient"]["tensors"],
+            "checkpoint_reload":True,"reload_uv_mean_difference":reload_error,"optimizer_resume_to_step":3,"fp32_decoder":True,
+            "gt_independence":True,"gt_independence_nonempty_fixture":True,"stale_latent_rejected":stale_rejected,
+            "validation_steps":[0,1,2,3],"output":str(out),
+            "quality":"functional smoke only; three repair steps do not train the new foreground head"}
 
 
 def stage_generation(config,data,device):
@@ -237,7 +367,7 @@ def stage_full(config,data,device):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--stage",choices=("all","data","partial","generation","refinement","avatar","full"),default="all")
+    parser.add_argument("--stage",choices=("all","data","partial","generation","refinement","avatar","full","repair"),default="all")
     args=parser.parse_args()
     if os.environ.get("CUDA_VISIBLE_DEVICES")!="0":
         raise ValueError("이 smoke는 physical GPU 0만 사용한다. CUDA_VISIBLE_DEVICES=0으로 실행하세요.")
@@ -248,15 +378,15 @@ def main():
     report_path=root/"report.json"
     report=json.loads(report_path.read_text()) if report_path.exists() else {}
     report.update(physical_gpu=0,device=torch.cuda.get_device_name(device),config=config,scope="functional smoke, not trained avatar quality")
-    functions={"data":stage_data,"partial":stage_partial,"generation":stage_generation,"refinement":stage_refinement,"avatar":stage_avatar,"full":stage_full}
+    functions={"data":stage_data,"partial":stage_partial,"generation":stage_generation,"refinement":stage_refinement,"avatar":stage_avatar,"full":stage_full,"repair":stage_repair}
     for name,function in functions.items():
-        if args.stage not in ("all",name) or (name=="full" and args.stage!="full"):
+        if args.stage not in ("all",name) or (name in ("full","repair") and args.stage!=name):
             continue
         start=time.monotonic()
         torch.cuda.reset_peak_memory_stats(device)
         print(f"SMOKE {name}: start",flush=True)
         try:
-            value=function(config,root/"data",device) if name=="data" else function(config,L00.PreparedData(root/"data"),device)
+            value=function(config,root/"data",device) if name=="data" else function(config,None,device) if name=="repair" else function(config,L00.PreparedData(root/"data"),device)
             value.update(status="passed",seconds=time.monotonic()-start,gpu_peak_gb=torch.cuda.max_memory_allocated(device)/1024**3)
             report[name]=value
             print(f"SMOKE {name}: passed",flush=True)

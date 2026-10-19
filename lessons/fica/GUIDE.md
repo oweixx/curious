@@ -7,7 +7,7 @@
 | Part | 파일 | 이번에 확인할 질문 | 먼저 읽을 함수 |
 |---|---|---|---|
 | 00 | `00_prepare_nersemble.py` | 이미지·camera·canonical mesh의 대응이 맞는가? | `prepare_dataset`, `rasterize_labels`, `MeshBridge` |
-| 01 | `01_partial_uv.py` | RGB 한 장의 픽셀을 어디의 UV texel로 옮기는가? | `DensePredictor`, `prediction_loss`, `compose_predictions` |
+| 01 | `01_partial_uv.py` | RGB 한 장의 픽셀을 어디의 UV texel로 옮기는가? | `DensePredictor`, `UVValidityPredictor`, `train_uv_repair`, `resample_partial_uv` |
 | 02 | `02_generate_uv.py` | 불완전한 관측에서 texture/geometry 전체를 어떻게 생성하는가? | `FrozenConditioners`, `UVFlowModel`, `flow_loss`, `sample_domains` |
 | 03 | `03_refine_uv.py` | 이미지의 오차를 어떤 UV 수정으로 연결하는가? | `RefinementNet`, `feature_pair`, `refinement_loss` |
 | 04 | `04_gaussian_avatar.py` | Identity를 유지하면서 표정에 맞는 Gaussians를 만드는가? | `IdentityEncoder`, `UniversalPrior`, `decode`, `render` |
@@ -103,6 +103,10 @@ CUDA_VISIBLE_DEVICES=0 python 00_prepare_nersemble.py --frames 0,32 --data data/
 partial UV, visibility를 확인한다. 원본 tensor는 `frames/*.pt`, identity의 texture/geometry와
 UV lookup은 `identities/*.pt`, split/단위/normalization은 `manifest.json`에 있다.
 
+비교 패널은 종횡비를 유지해 가운데를 정사각형으로 crop한 뒤 표시한다. 직사각형 RGB를
+정사각형으로 강제 변형하지 않는다. 이 crop은 시각화에만 적용하며 학습 RGB·alpha·label과
+camera K는 00의 비율 유지 resize 좌표계를 사용한다.
+
 두 frame의 대응이 맞는 것을 확인한 뒤, 학습 자료는 별도 기본 경로에 준비한다.
 `--frames all`은 모든 frame을 사용한다. 옵션을 생략하면 빠른 확인을 위해 25 frame
 간격으로 고른다. 이 작은 subset을 전체 데이터셋 학습으로 간주하지 않는다.
@@ -172,21 +176,181 @@ geometry의 한계와 UV coverage를 함께 평가한다.
 CUDA_VISIBLE_DEVICES=0 python 01_partial_uv.py --stage train --task uv
 CUDA_VISIBLE_DEVICES=0 python 01_partial_uv.py --stage train --task xyz
 CUDA_VISIBLE_DEVICES=0 python 01_partial_uv.py --stage train --task normal
+CUDA_VISIBLE_DEVICES=0 python 01_partial_uv.py --stage finetune-uv --steps 3000
 CUDA_VISIBLE_DEVICES=0 python 01_partial_uv.py --stage predict
 ```
 
 세 task는 별도의 실제 Sapiens-1B encoder를 fine-tune한다. UV/XYZ는 L1, normal은 cosine
-loss다. Encoder LR을 head보다 작게 사용하고, dense labels에 같은 crop/scale을 적용한다.
+loss다. Encoder LR을 head보다 작게 사용한다. **학습 입력도 비율을 보존하는 crop**이다.
+00의 RGB를 Sapiens 입력의 `H:W=4:3`에 맞게 자르고, 모델 내부에서 `1024×768`로
+resize한다. 예를 들어 저장된 `512×351` 이미지는 validation에서 중앙 `468×351`로
+crop되므로 얼굴 비율이 유지된다. 얼굴 검출 bbox crop은 아니다.
+학습은 최대 crop의 80–100% 크기와 위치를 무작위로 정하고, validation/최종 예측은
+최대 크기의 중앙 crop을 고정한다. RGB·alpha·UV·XYZ·normal·valid에 **동일한 crop**을
+적용하며, dense label 값은 보간하거나 바꾸지 않는다. K/keypoints도 crop 좌표계로 이동한다.
 RGB에는 photometric augmentation을 적용한다. Identity를 먼저 균등 sample하고 view angle
 기반 importance weight로 frame/view를 고른다. Weight 식은 공개되지 않아 구현 선택으로 기록한다.
 
-`outputs/01/*.jpg`에서 GT-correspondence로 만든 UV와 **Network가 예측한 대응**으로 만든
-UV를 비교한다. 전자는 디버깅 기준이다. 예측이 틀려도 다음 단계에 GT를 몰래 넣지 않는다.
-이미지→UV는 forward mapping이므로 `scatter_add`로 bilinear splat한다. 겹치는 관측의
-가중치와 빈 texel을 함께 저장한다. 학습 완료 시의 전체 자료 예측은 `data/prepared/predictions/`,
-조합된 10ch partial UV는 `partial_pred/`에 저장된다.
+### 100 step마다 validation 보기
+
+기본 실행은 `--run-name crop --val-every 100 --val-frames 8`이다. 학습 터미널은
+**tqdm bar 하나에 train loss와 최근 validation loss**만 표시한다. Gradient 등의 상세
+수치는 `training.jsonl`에 기록하고, step별 디버깅 문구는 출력하지 않는다.
+
+`outputs/01/crop/uv/validation/0.jpg`, `100.jpg`, `200.jpg`, …로 저장한다.
+XYZ/normal도 각 task 폴더 안에 같은 구조를 사용하며 step별 폴더를 만들지 않는다.
+0은 학습 전 기준이고, 100은 **gradient accumulation을 마친 optimizer update 100회**다.
+최종 step이 100의 배수가 아니면 별도 validation 이미지를 추가하지 않는다.
+`--val-every`로 간격을 바꿀 수 있다. Checkpoint 저장 간격은 기존 1,000 step이다.
+
+항상 같은 held-out frame을 미리보기로 사용한다. 평가는 manifest 순서상 처음 최대
+8개 validation frame에서 수행하고 `--val-frames 0`이면 전체를 사용한다. 현재 로컬 자료는
+validation 7개이므로 모두 평가한다. 학습 frame으로 validation을 대신하지 않는다.
+각 패널은 실제 모델 입력, GT, 예측, 고정 색상 척도의 오차를 보여준다.
+UV에는 GT/예측 대응으로 RGB를 UV에 splat한 비교도 추가한다. 이는 UV만의 진단이며
+세 predictor를 합친 최종 10ch partial UV와는 구분한다. 화면 비율은 letterbox로 보존한다.
+
+`validation/metrics.jsonl`에는 전체 평가 frame의 valid pixel 수로 가중 평균한 loss와
+UV 거리(texel), XYZ 거리(world unit), normal 각도(degree)를 기록한다. 이미지 상단 수치는
+표시된 한 frame의 값이다. 검증에는 `eval/no_grad`를 사용하고 optimizer는 갱신하지 않는다.
+이 split은 같은 사람의 다른 frame이므로 새 사람에 대한 일반화 평가가 아니다.
+
+**이전 학습 결과는 보존한다.** 새 checkpoint는 `checkpoints/01/crop/<task>.pt`에 저장한다.
+이전에 학습한 `checkpoints/01/<task>.pt`는 수정하지 않는다. 전처리가 바뀐 이전 학습은
+동일 실험의 `--resume`으로 취급하지 않는다. 기존 weight를 활용하려면 다음처럼 시작한다.
+Optimizer와 step을 초기화하고, 새 `0.jpg`부터 crop 입력에 적응시키는 학습이다.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python 01_partial_uv.py --task uv --init-from checkpoints/01/uv.pt
+CUDA_VISIBLE_DEVICES=0 python 01_partial_uv.py --task xyz --init-from checkpoints/01/xyz.pt
+# normal.pt를 저장해 둔 경우에만 --init-from checkpoints/01/normal.pt를 추가한다.
+CUDA_VISIBLE_DEVICES=0 python 01_partial_uv.py --task normal
+```
+
+새 run을 중단했다가 이어갈 때는 같은 `--run-name`과 `--resume`을 사용한다.
+완전히 새 학습은 `--run-name crop_v2`처럼 이름을 바꾼다. `--steps`는 추가 횟수가 아니라
+최종 목표 step이다. 기존 checkpoint를 학습 없이 crop 입력에서 평가할 수도 있다.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python 01_partial_uv.py --stage validate --task uv --checkpoint checkpoints/01/uv.pt --run-name legacy_validation
+```
+
+이는 기존 weight의 **새 전처리에서의 평가**다. 예전 resize 기반 성능과 동일한 측정이 아니다.
+Weight만 읽는 평가/초기화에서도 task·dataset·전체 state key/shape를 확인하며,
+이전 코드/설정은 provenance에 기록한다. Optimizer를 복원하는 resume의 엄격한
+config/data/code 검사는 유지한다.
+
+기존 `outputs/01/*.jpg`는 person mask와 point splat을 쓴 비교 결과다.
+`--stage predict --legacy-splat`으로 같은 방식을 명시적으로 다시 확인할 수 있다.
+학습한 영역보다 넓은 사람 mask를 사용해 머리카락/옷의 미감독 UV가 섞이는 문제가 있어,
+기본 predict는 아래 추가 학습의 **예측 foreground + 면 기반 UV resampling**을 사용한다.
+새 모델/예측이 없으면 중단하며 GT mask나 이전 person mask로 대신하지 않는다.
+조합된 10ch partial UV는 `data/prepared/partial_pred/`에 저장된다.
+최종 예측 tensor는 원본 사진의 `H×W`로 되돌려 저장한다. Crop 밖 UV는 `-1`로 채워
+splat 대상에서 제외하고, XYZ/normal은 0으로 둔다. Crop/run/step은 같은 이름의 JSON에
+남긴다. 02 이후의 RGB·camera·image-space prediction 대응을 유지하기 위한 처리다.
+세 task 중 일부만 이전 resize 방식으로 남아 있으면 `predict`에서 중단한다.
+UV/XYZ/normal 모두 같은 crop 좌표계의 예측을 준비한 뒤 조합한다.
+
+### 기존 50K UV에서 추가 학습하기
+
+이 과정은 **우리 구현의 보완**이다. Auxiliary validity head, BCE/Dice,
+FP32 UV decoder, source-grid triangulation은 공개되지 않은 FiCA 저자의 원본 코드라고
+주장하지 않는다. 01에서 신뢰할 수 있는 관측을 만들고, 남은 오차/미관측 부위는 02의
+diffusion이 다룬다는 학습 목표는 유지한다.
+
+이미 UV·XYZ·normal을 학습했다면 3개를 다시 학습할 필요가 없다.
+아래 명령은 기본적으로 `checkpoints/01/crop/uv.pt`의 **weight만** 가져온다.
+새 목표와 새 head 때문에 optimizer는 초기화하고, 추가 step을 0부터 센다.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python 01_partial_uv.py --stage finetune-uv --steps 3000
+```
+
+다른 UV checkpoint를 사용하려면 `--init-from checkpoints/01/다른_run/uv.pt`를 지정한다.
+기존 50K checkpoint, XYZ/normal cache, 원래 UV 예측은 보존한다.
+
+1. **처음 100 step:** backbone/기존 UV decoder를 고정하고 새 validity head만 학습한다.
+2. **이후:** backbone, UV decoder, validity head를 함께 추가 학습한다.
+3. **완료:** 새 UV2와 foreground probability1을 전체 frame에 export한다.
+
+`DenseHead.forward_features`의 기존 384ch feature에서 두 분기로 나뉜다.
+기존 `conv_seg`는 UV2를 출력하고, 새 `384→64→1` convolution head는 foreground logit을
+출력한다. UV decoder/head/보간은 FP32이고 encoder는 기존 BF16 autocast를 사용한다.
+이때 foreground 확률은 **이 픽셀이 UV 학습 대상인가**를 나타내며 UV 좌표의 정확도
+자체를 보증하는 confidence는 아니다.
+
+Loss는 기존 foreground UV L1 + `0.05 × (balanced BCE + 0.5 × Dice loss)`다.
+UV L1은 valid 표면에서, mask loss는 배경까지 포함한 이미지 전체에서 계산한다.
+Balanced BCE는 foreground/background pixel 평균에 같은 비중을 준다.
+학습률은 encoder `1e-6`, 기존 UV decoder `1e-5`, 새 validity head `1e-3`다.
+설정은 `fica_config.json`의 `uv_repair`에서 읽는다. `--warmup-steps`로 warmup을 조절한다.
+
+추가 학습도 tqdm bar 하나를 사용하고, **0/100/200/... step**의 고정 validation을 저장한다.
+
+- Checkpoint: `checkpoints/01/uv_repair/uv.pt` (기본 1,000 step 간격 + 마지막)
+- Validation: `outputs/01/uv_repair/uv/validation/0.jpg`, `100.jpg`, …
+- 세부 지표: 같은 폴더의 `metrics.jsonl`
+- 새 cache: `data/prepared/predictions/uv_repair/{uv,validity}/`
+
+새 mask head가 보수적으로 초기화되므로 초기 validation의 partial UV가 비어 있을 수 있다.
+기존 UV가 지워진 것이 아니다. 학습하면서 **validity IoU/precision/recall, source precision,
+UV 오차, 실제 RGB/normal partial UV**를 함께 확인한다. GT mask는 loss/지표/GT 비교
+패널에만 사용한다. 실제 예측 패널은 예측 mask와 기존 XYZ/normal cache로 만든다.
+추가 학습 이미지 상단의 수치는 validation frame 전체의 집계값이다.
+따라서 UV loss만 낮고 background가 UV에 섞이는 문제도 확인할 수 있다.
+Overlap RGB L1은 GT와 예측 둘 다 관측한 texel에서만 계산하므로 coverage와 함께 읽는다.
+
+같은 추가 학습을 이어갈 때는 `--resume`을 사용한다. `--steps`는 최종 **추가 학습** step이다.
+예를 들어 1,000에서 중단했다면 다음은 1,001–3,000을 진행한다.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python 01_partial_uv.py --stage finetune-uv --steps 3000 --resume
+```
+
+새 실험은 `--run-name uv_repair_v2`로 분리한다. 중간 checkpoint는 별도로 평가할 수 있다.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python 01_partial_uv.py --stage validate --run-name uv_repair
+```
+
+학습 완료 후 최종 partial UV를 만든다. 기본 threshold는 `.7`이다.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python 01_partial_uv.py --stage predict
+```
+
+이 단계는 예측 foreground와 person alpha의 교집합에서, UV 범위와 XYZ/normal의 유한성을
+검사한다. 인접한 유효 pixel cell을 UV 삼각형으로 rasterize하고 원본 image 좌표를
+보간한 뒤 `grid_sample`로 RGB/XYZ/normal을 함께 읽는다. Normal은 다시 단위 벡터로 만든다.
+네 꼭짓점이 모두 유효한 cell만 쓰고, UV seam/국소 fold/퇴화 cell을 제외한다.
+기본 `max_uv_edge=.03`은 정규화 UV 단위이며 길게 늘어나는 관측도 보수적으로 제외할 수 있다.
+관측되지 않은 UV를 임의로 채우지 않는다. `weight`는 이 방식에서는 point splat 누적량이
+아닌 raster coverage이며, metadata의 `weight_kind`에 구분해 기록한다.
+
+최종 비교 이미지는 `outputs/01/uv_repair/predictions/`에 생긴다. `data/prepared/partial_pred/`
+는 새 결과로 갱신하므로, 02를 시작하기 전에 **latent cache를 다시 만들어야 한다**.
+02는 partial 파일의 SHA256을 함께 저장하고 오래된 latent의 학습/추론 재사용을 거부한다.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python 02_generate_uv.py --stage cache
+```
+
+학습은 끝났지만 export 도중 중단되었다면 학습을 다시 돌릴 필요 없이 다음을 사용한다.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python 01_partial_uv.py --stage export --run-name uv_repair
+```
+
+`CUDA_VISIBLE_DEVICES=0 python smoke.py --stage repair`는 실제 1B/기존 UV weight를 사용해
+warmup→joint 학습, 저장/재로딩/optimizer resume, FP32 출력, UV seam, GT 독립성,
+02 cache 검사를 별도 `.cache/smoke/repair_data`에서 수행한다. 입력은 smoke 해상도다.
+새 head를 3 step 학습한 smoke 결과를 수렴한 결과로 해석하지 않는다.
 
 ## 02 — Noise에서 UV와 mesh가 만들어지는지 보기
+
+이 part에서는 아래 **Pippo 원본을 직접 읽기**를 먼저 진행한다. 원본 source의
+`ControlMLP`와 `DiTBlock`을 이해한 뒤 `UVFlowModel`이 이들을 어떻게 연결하는지 확인한다.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python 02_generate_uv.py --stage cache
@@ -304,6 +468,148 @@ forward/backward가 모두 통과했다. Full UPM은 유효 UV texel의 235,498�
 2 microbatch→1 optimizer step도 별도로 검증했다. 실제 VHAP export의 single-camera
 재가져오기/68 landmark/white composite 검증 결과는 `.cache/smoke/vhap_import.json`,
 재개 검증은 `training_controls.json`, 단계별 결과는 `report.json`에 있다.
+
+## Pippo 원본을 직접 읽기
+
+FiCA의 UV 생성기를 이해할 때 Pippo는 핵심 학습 대상이다. 현재 02도 원본의
+`DiTBlock`, `ControlMLP`, `TimestepEmbedder`를 그대로 import하지만, 필요한 파일만
+`.cache/reference/pippo/`에서 읽는다. 전체 모델의 흐름을 공부하기 위해 공식 저장소를
+**수정하지 않은 전체 checkout**으로 `external/pippo/`에 준비했다.
+
+원본: [facebookresearch/pippo](https://github.com/facebookresearch/pippo/tree/6f80b22f32f58f7ae08f7b20a4901a3c66809368).
+Commit은 `6f80b22f32f58f7ae08f7b20a4901a3c66809368`로 본편과 같다. 외부 checkout은
+Git에서 제외하고, 이 가이드와 `pippo_walkthrough.py`를 관리한다. 다른 PC에서 준비하려면:
+
+```bash
+cd /media/vilab/mh/curious/lessons/fica
+git clone https://github.com/facebookresearch/pippo.git external/pippo
+git -C external/pippo checkout --detach 6f80b22f32f58f7ae08f7b20a4901a3c66809368
+```
+
+Pippo는 사진에서 여러 시점의 **이미지**를 생성하는 모델이다. FiCA는 그 기반에서
+canonical **UV texture/geometry**를 생성한다. 따라서 원본의 전체 `Pippo` class와
+현재 `UVFlowModel`은 같은 모델이 아니다. 원본 block을 가져오는 부분과 FiCA 문제에 맞게
+구성한 부분을 아래 순서로 구별해서 읽는다. 원본 전용 pretrained weight는 배포되지 않았다.
+
+### 1. 파일보다 tensor의 이동 순서부터 보기
+
+`external/pippo/` 기준으로 읽을 순서는 다음과 같다.
+
+| 순서 | 원본 파일·정의 | 확인할 내용 |
+|---|---|---|
+| 1 | `blocks/patch.py`의 `PatchifyPS`, `UnpatchifyPS` | 공간 배열이 token sequence로 바뀌고 돌아오는 과정 |
+| 2 | `blocks/timestep.py`의 `TimestepEmbedder` | scalar noise time을 feature vector로 바꾸는 과정 |
+| 3 | `models/control_mlp.py`의 `ControlEncoderLatent` → `ZeroControlBlock` → `ControlMLP` | 공간 조건을 block별 control token으로 만드는 과정 |
+| 4 | `models/dit.py`의 `DiTBlock.forward` → `DiT.forward` | control이 attention/MLP 중 어디에 들어가고 residual과 어떻게 합쳐지는가 |
+| 5 | `models/pippo.py`의 `forward` → `get_conds` → `predict` | RGB/VAE, reference, camera, spatial anchor, Plücker 조건이 모이는 전체 과정 |
+| 6 | `config/full/512_4v.yml`, `train.py`, `losses.py`, `schedulers/diffusion.py` | 실제 configuration, noise target과 backward의 연결 |
+
+위 파일들은 모두 `latent_diffusion/` 아래에 있다. `train.py`와 `config/`는 저장소 root다.
+다음 명령은 원본 정의의 **실제 파일/줄 번호**를 출력한다.
+
+```bash
+python pippo_walkthrough.py --part files
+```
+
+처음부터 1,000줄이 넘는 `Pippo` class를 전부 읽기보다, 작은 단위에서 이해한 뒤 5번에서
+전체 연결을 확인한다. 공식 source를 별도 교육용 Network로 다시 작성하지 않는다.
+
+### 2. 작은 tensor로 원본 연산을 직접 따라가기
+
+`pippo_walkthrough.py`는 원본 class를 호출하고 tensor shape를 출력하는 읽기 보조 파일이다.
+`patch/control/block`의 입력과 target은 **연산 확인용 작은 합성 tensor**이며 avatar 학습
+결과로 사용하지 않는다. 원본 file은 변경하지 않고 hook과 debugger로 내부를 살펴본다.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python pippo_walkthrough.py --part patch
+CUDA_VISIBLE_DEVICES=0 python pippo_walkthrough.py --part control
+CUDA_VISIBLE_DEVICES=0 python pippo_walkthrough.py --part block
+```
+
+**Patch:** 작은 packed latent `1×16×8×8`이 `1×16×64` token으로 바뀐다.
+두 번째 16은 4×4개의 공간 주소, 마지막 64는 학습된 feature 차원이다.
+원본 `PatchifyPS`는 PixelUnshuffle → 1×1 conv → LayerNorm을 사용한다.
+현재 FiCA 본편은 packing → `unfold` → Linear로 연결하며 원본 `PatchifyPS` 전체를
+그대로 사용한 것은 아니다. 이 차이도 비교할 대상이다.
+
+**Control:** 본 설정에서는 partial의 네 VAE latent가 합쳐져 `16×64×64`, packing 후
+`64×32×32`가 된다. `ControlEncoderLatent`가 공간 크기를 절반으로 줄여 `D×16×16`을
+만들고 `256×D` token으로 펼친다. Target도 같은 16×16 patch 위치를 사용한다.
+공유 encoder가 만든 h를 block마다 별도의 `ZeroControlBlock`에 전달한다.
+이 block들은 depth 방향으로 직렬 연결된 MLP가 아니다.
+
+ZeroControlBlock은 timestep에서 shift/scale을 만들고 다음을 계산한다.
+
+```text
+control_i = zero_linear_i((1 + scale_i(time)) * h + shift_i(time))
+```
+
+처음에는 zero_linear가 0이므로 control도 0이다. 예제의 첫 backward에서는
+zero_linear의 gradient는 존재하지만 앞쪽 encoder의 gradient는 0임을 직접 확인한다.
+이는 zero initialization의 결과다. 한 번 update하면 control이 0에서 벗어난다.
+
+**DiTBlock:** 이 원본은 익숙한 attention→MLP 직렬 block과 연산 배치가 다르다.
+같은 `Linear(LN(x))` 결과를 MLP feature와 Q/K/V로 나눈다. 두 branch를 계산하고,
+Control은 **MLP branch에 더한 뒤**, global condition의 shift/scale/gate를 적용한다.
+Cross-attention을 끈 현재 FiCA 경로를 간추리면:
+
+```text
+m, q, k, v = split(Linear(LN(x)))
+a = attention_output(SDPA(normalize(q), normalize(k), v))
+m = mlp_output(GELU(m)) + control_i
+x_next = x + gate_a * modulate(a) + gate_m * modulate(m)
+```
+
+`cond_adaln`은 attention과 MLP 각각에 쓸 shift/scale/gate, 총 6D를 만든다.
+원본 `DiT.initialize_weights`는 gate를 0으로 초기화한다. 따라서 첫 block 출력이
+입력 x와 같은 현상과, gate update 뒤 control이 출력에 영향을 주는 현상을 확인한다.
+Block class 자체의 생성자만 호출하는 것과 `DiT`의 초기화까지 거치는 것은 구별해야 한다.
+
+원본 첫 줄에서 멈춰 직접 진행하려면:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python pippo_walkthrough.py --part block --break
+```
+
+`p x.shape`, `p control.shape`로 값을 확인하고 `n`으로 다음 줄, `s`로 함수 내부,
+`c`로 계속 진행한다. 여기서 실제 `external/pippo/latent_diffusion/models/dit.py`를 읽는다.
+Hook은 `in_proj`, Q normalization, 6D modulation의 shape를 출력하며 연산을 바꾸지 않는다.
+
+### 3. 원본 전체 흐름을 FiCA 02에 연결하기
+
+`Pippo.forward`에서는 이미지를 VAE로 encoding하고 noise를 섞는다. `get_conds`가
+reference/camera/spatial 조건과 controls를 구성하고, `predict`가 generator를 호출한다.
+원본의 multi-view reference token 결합과 attention biasing은 이 전체 문맥에서 읽는다.
+
+| 항목 | 원본 Pippo 공개 설정/코드 | 현재 FiCA lesson 02 |
+|---|---|---|
+| 생성 대상 | 여러 시점의 RGB image latent | canonical texture/geometry latent |
+| Reference | reference image tokens 및 camera conditioning | CLIP embedding + texture/geometry domain embedding |
+| 공간 조건 | spatial anchor, camera/Plücker 관련 경로 | partial RGB/mask/normal/XYZ의 VAE latent |
+| 공통으로 직접 사용하는 부분 | DiTBlock, ControlMLP, timestep embedding | 동일한 원본 class |
+| Token/모델 연결 | 원본 `DiT`, `Pippo`가 수행 | lesson의 `UVFlowModel`이 구성 |
+| 학습 target | 공개 config의 eps + cosine noise schedule | FiCA에 맞춘 linear flow velocity `target-noise` |
+| 세부 설정 | full/512 config의 width1536, depth28, heads24 | width1792/depth28/heads28; FiCA 미공개 width의 구현 선택 |
+
+Pippo의 scheduler에서 말하는 eps/v와 이 lesson의 flow velocity를 같은 정의로 취급하지
+않는다. Architecture를 가져오는 것과 noise schedule/loss까지 그대로 가져오는 것은 다르다.
+특히 FiCA 전용 CLIP/domain 연결과 latent packing은 우리가 구성한 adapter다.
+
+아래는 이전 `smoke.py`가 만든 **실제 partial UV latent와 학습된 02 smoke checkpoint**로
+본편의 호출을 따라간다. 작은 합성 진단에서 실제 lesson으로 돌아오는 단계다.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python pippo_walkthrough.py --part fica
+```
+
+이 호출에서는 전체 checkout의 class를 우선 import하고, 본편 cache와 source hash가
+일치하는지 확인한다. 기존 checkpoint의 parameter 이름/값과 원본 class가 호환되는지,
+partial control이 velocity 출력에 영향을 주는지 검사한다. VAE/CLIP은 다시 다운로드하거나
+학습하지 않는다. Cache/checkpoint가 없다면 앞서 `smoke.py`를 실행해야 한다.
+
+2026-10-18, physical GPU 0에서 네 part를 모두 실행해 통과했다. 결과는
+`.cache/pippo_walkthrough/all.json`, 출력은 `.cache/pippo_walkthrough.log`에 있다.
+이 검증은 원본 전체 Pippo의 대규모 학습이나 FiCA 품질 검증을 의미하지 않는다.
 
 영상·가중치·캐시·출력은 `.gitignore`로 제외한다. 루트 README와 기존 ELITE lesson은 수정하지 않는다.
 논문/기반 코드 링크와 구현 귀속은 `NOTICE.md`에 있다.

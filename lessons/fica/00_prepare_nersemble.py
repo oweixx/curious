@@ -79,6 +79,8 @@ def read_config(path=None, smoke=False):
     config = json.loads(Path(path or ROOT / "fica_config.json").read_text())
     if config["format"] != "fica_nersemble_v1":
         raise ValueError("다른 lesson/checkpoint format이다.")
+    if "uv_repair" not in config:
+        config["uv_repair"] = json.loads((ROOT / "fica_config.json").read_text())["uv_repair"]
     if smoke:
         # Smoke의 모델 축소는 명시적이다. 실제 foundation weights는 축소/대체하지 않는다.
         config["uv_size"], config["image_size"] = 64, 128
@@ -87,6 +89,7 @@ def read_config(path=None, smoke=False):
         config["upm"]["channels"] = [64, 32, 16, 16]
         config["training"].update(steps=2, preview_every=1, checkpoint_every=2)
         config["sapiens"].update(input_size=[128,96],augmentation=False)
+        config["uv_repair"].update(steps=2, warmup_steps=1, checkpoint_every=2)
     if config["training"]["batch_size"]!=1 or config["training"]["grad_accumulation"]<1:
         raise ValueError("가변 camera 해상도 때문에 microbatch=1을 사용한다. effective batch는 grad_accumulation으로 늘리세요.")
     config["profile"] = "smoke" if smoke else "full"
@@ -164,13 +167,22 @@ def save_image(path, value):
 
 
 def save_panels(path, images, labels):
-    """각 milestone에서 같은 sample을 비교한다. 표시만 resize한다."""
+    """표시용 비교: 종횡비를 유지하고 중앙 square crop 후 256px로 줄인다.
+
+    RGB/render/normal에 같은 중앙 crop을 적용한다. 정사각형 UV는 그대로다.
+    저장된 학습 tensor나 camera K를 바꾸는 전처리 crop과는 별개다.
+    """
     panels = []
     for value in images:
         value = value.detach().float().cpu()
         if value.ndim == 4:
             value = value[0]
         value = value.expand(3, -1, -1)
+        # 직사각형을 바로 256x256으로 resize하면 얼굴이 세로로 눌려 보인다.
+        height, width = value.shape[-2:]
+        side = min(height, width)
+        top, left = (height-side)//2, (width-side)//2
+        value = value[:, top:top+side, left:left+side]
         value = F.interpolate(value[None], size=(256, 256), mode="bilinear", align_corners=False)[0]
         array = (value.clamp(0, 1).permute(1, 2, 0).numpy() * 255).round().astype(np.uint8)
         panels.append(Image.fromarray(array))

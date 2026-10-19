@@ -194,20 +194,29 @@ def build_cache(data, device, source="predicted"):
         identity = data.identity(row["identity"], device)
         stem = Path(row["file"]).stem
         if source == "predicted":
-            partial = L00.load_tensor(data.path / "partial_pred" / f"{stem}.pt", device)["partial"]
+            partial_path = data.path / "partial_pred" / f"{stem}.pt"
+            partial = L00.load_tensor(partial_path, device)["partial"]
         elif source == "gt_correspondence":
             partial = sample["partial_gt"]
         else:
             raise ValueError(source)
         cache = conditioners.encode_sample(sample, identity, partial)
         cache.update(partial_source=source, identity=row["identity"], source=row["file"])
+        if source == "predicted":
+            cache["partial_sha256"] = L00.sha256(partial_path)
         L00.save_tensor(data.path / "latents" / f"{stem}.pt", cache)
     del conditioners
     torch.cuda.empty_cache()
 
 
 def read_cache(data, row, device):
-    return L00.load_tensor(data.path / "latents" / f"{Path(row['file']).stem}.pt", device)
+    stem = Path(row["file"]).stem
+    cache = L00.load_tensor(data.path / "latents" / f"{stem}.pt", device)
+    if cache["partial_source"] == "predicted":
+        partial_path = data.path / "partial_pred" / f"{stem}.pt"
+        if cache.get("partial_sha256") != L00.sha256(partial_path):
+            raise ValueError("partial UV가 바뀌었다. 02_generate_uv.py --stage cache를 다시 실행하세요.")
+    return cache
 
 
 def decoded_result(conditioners, latent, identity):

@@ -9,4 +9,5 @@ safetensors==0.5.3
 einops==0.8.1
 lpips==0.1.4
 ninja==1.11.1.4
+tqdm==4.67.1
 # CUDA extension 설치 명령과 Torch 버전은 GUIDE.md에 있다.
