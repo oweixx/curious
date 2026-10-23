@@ -81,15 +81,18 @@ def read_config(path=None, smoke=False):
         raise ValueError("다른 lesson/checkpoint format이다.")
     if "uv_repair" not in config:
         config["uv_repair"] = json.loads((ROOT / "fica_config.json").read_text())["uv_repair"]
+    if "geometry_repair" not in config:
+        config["geometry_repair"] = json.loads((ROOT / "fica_config.json").read_text())["geometry_repair"]
     if smoke:
         # Smoke의 모델 축소는 명시적이다. 실제 foundation weights는 축소/대체하지 않는다.
         config["uv_size"], config["image_size"] = 64, 128
         config["diffusion"].update(width=128, depth=2, heads=4)
-        config["refinement"].update(channels=[32, 64], layers_per_block=1)
+        config["refinement"].update(channels=[32, 64], layers_per_block=1, steps=2, val_every=1, checkpoint_every=2)
         config["upm"]["channels"] = [64, 32, 16, 16]
         config["training"].update(steps=2, preview_every=1, checkpoint_every=2)
         config["sapiens"].update(input_size=[128,96],augmentation=False)
         config["uv_repair"].update(steps=2, warmup_steps=1, checkpoint_every=2)
+        config["geometry_repair"].update(steps=2, warmup_steps=0, geometry_every=1, checkpoint_every=2)
     if config["training"]["batch_size"]!=1 or config["training"]["grad_accumulation"]<1:
         raise ValueError("가변 camera 해상도 때문에 microbatch=1을 사용한다. effective batch는 grad_accumulation으로 늘리세요.")
     config["profile"] = "smoke" if smoke else "full"
@@ -354,11 +357,14 @@ class MeshBridge(nn.Module):
     """Barycentric UV position map -> 원래 mesh vertex의 미분 가능한 least squares.
 
     G=A V를 역으로 푼다. UV seam의 여러 texel이 같은 vertex를 감독한다.
-    (A^T A + ridge I)V=A^T G + ridge V_template. 낮은 UV 해상도의 rank 부족만
-    template ridge로 안정화한다. full mesh를 UV grid mesh로 바꾸지 않는다.
+    ||AV-G||² + ridge||V-V_template||² + laplacian||L(V-V_template)||².
+    작은 UV triangle의 좌표 오차가 긴 spike로 증폭되는 것을 이웃 변위 제약으로
+    줄인다. Template은 개인 정답이 아닌 공개 FLAME base다. laplacian=0은 기존 식.
     """
-    def __init__(self, topology, device, ridge=1e-4):
+    def __init__(self, topology, device, ridge=1e-4, laplacian=10.):
         super().__init__()
+        if ridge <= 0 or laplacian < 0:
+            raise ValueError("ridge > 0, laplacian >= 0 이어야 한다.")
         self.register_buffer("faces", topology["faces"].to(device).long())
         self.register_buffer("vt", topology["vt"].to(device))
         self.register_buffer("ft", topology["ft"].to(device).long())
@@ -377,9 +383,21 @@ class MeshBridge(nn.Module):
             for j in range(3):
                 matrix.index_add_(0, ids[:, i] * n + ids[:, j], bary[:, i] * bary[:, j])
         matrix = matrix.reshape(n, n)
+        edges = torch.unique(torch.sort(torch.cat([self.faces[:, [0, 1]], self.faces[:, [1, 2]], self.faces[:, [2, 0]]]), dim=-1).values, dim=0)
+        self.register_buffer("edges", edges)
+        prior_rhs = self.template * ridge
+        if laplacian:
+            directed = torch.cat((edges, edges.flip(1)))
+            degree = torch.bincount(directed[:, 0], minlength=n).float()
+            operator = torch.eye(n, device=device)
+            operator[directed[:, 0], directed[:, 1]] = -1/degree[directed[:, 0]]
+            smoothness = operator.T @ operator
+            matrix.add_(smoothness, alpha=laplacian)
+            prior_rhs = prior_rhs + laplacian*(smoothness @ self.template)
         matrix.diagonal().add_(ridge)
         self.register_buffer("factor", torch.linalg.cholesky(matrix))
-        self.ridge = ridge
+        self.register_buffer("prior_rhs", prior_rhs)
+        self.ridge, self.laplacian = ridge, laplacian
 
     def vertices_to_uv(self, vertices):
         values = (vertices[self.corner_ids] * self.weights[..., None]).sum(1)
@@ -389,7 +407,7 @@ class MeshBridge(nn.Module):
 
     def forward(self, xyz):
         values = xyz.permute(1, 2, 0).reshape(-1, 3)[self.indices]
-        rhs = self.template * self.ridge
+        rhs = self.prior_rhs
         for corner in range(3):
             rhs = rhs.index_add(0, self.corner_ids[:, corner], values * self.weights[:, corner:corner+1])
         return torch.cholesky_solve(rhs, self.factor)
@@ -656,7 +674,7 @@ def append_log(path, record):
 
 
 def checkpoint(path, model, optimizer, config, data, step, extra=None):
-    save_tensor(path, {"format": "fica_checkpoint_v1", "model": model.state_dict(), "optimizer": optimizer.state_dict(),
+    save_tensor(path, {"format": "fica_checkpoint_v1", "model": model.state_dict(), "optimizer": optimizer.state_dict() if optimizer is not None else None,
         "config": config, "step": step, "data_sha256": sha256(data.path / "manifest.json"),
         "code_hashes": code_hashes(), "extra": extra or {}, "external_revisions":ASSETS,
         "rng_torch":torch.get_rng_state(),"rng_cuda":torch.cuda.get_rng_state_all(),"rng_python":random.getstate()})
@@ -672,6 +690,8 @@ def restore(path, model, config, data, optimizer=None):
         raise ValueError("checkpoint 이후 lesson 코드가 바뀌었다. 기존 실험을 보존하세요.")
     model.load_state_dict(state["model"], strict=True)
     if optimizer is not None:
+        if state["optimizer"] is None:
+            raise ValueError("이 checkpoint는 추론용 weight만 있다. optimizer 재개에는 latest.pt를 사용하세요.")
         optimizer.load_state_dict(state["optimizer"])
         torch.set_rng_state(state["rng_torch"].cpu())
         torch.cuda.set_rng_state_all([x.cpu() for x in state["rng_cuda"]])

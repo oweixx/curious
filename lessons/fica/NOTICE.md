@@ -18,6 +18,27 @@ Balanced BCE/Dice, FP32 decoder, UV 삼각형 rasterization과 image grid sampli
 Diffusers UNet2DConditionModel을 사용한다. 캐시의 원본 source에는 각 프로젝트 LICENSE를
 함께 보존한다. 해당 코드/가중치/데이터의 이용 조건은 원래 배포처를 따른다.
 
+02의 geometry repair는 우리 데이터에서 확인한 XYZ VAE 복원 오차와 UV→mesh의
+ill-conditioning을 보완하는 구현이다. XYZ를 dataset std의 3배로 나누는 전처리,
+atlas padding까지 포함한 geometry latent loss, 고정 VAE를 통과한 endpoint XYZ/vertex/edge
+supervision, template-relative Laplacian MeshBridge는 저자의 공개 설정이 아니다.
+DiT/ControlMLP 구조와 SDXL VAE/CLIP weight는 유지하며, 원본 50K checkpoint와 cache는
+새 geometry_repair run의 weight 초기화/비교용으로 보존한다.
+
+03은 512×512 입출력과 고해상도 convolution/skip connection을 유지하되, self-attention과
+Sapiens feature cross-attention을 64×64 이하의 U-Net stage에 배치한다. 채널 폭은
+Diffusers 기본값을 사용한다. 이 attention 배치와 단일 identity의 기본 1K-step 학습량은
+우리의 계산량 조정이며 FiCA 저자의 공개 architecture/training 설정이 아니다.
+초기 구성은 논문의 refinement loss 종류와 바깥 가중치를 따르며, held-out frame의 전후 비교 및
+coarse FLAME vertex RMSE는 validation 진단으로 사용한다. 이후 quality 보완은 아래와 같다.
+
+03의 `surface_refinement_v2`는 관찰된 품질 문제를 보완하는 별도 구현 선택이다.
+UV→mesh 선형부로 계산한 중심 이동 제거, 얼굴 mask 내 평균 photo L1, 가중치 0.1의
+texture MSE, 초기 생성 mesh로부터의 변위 규제(0.01 world scale/가중치 0.25)를 사용한다.
+Photo/mask/keypoint의 바깥 가중치 2/0.5/0.01과 Laplacian/normal 규제는 유지하지만,
+위 reduction/추가 제약을 FiCA의 원본 loss 구현이라고 주장하지 않는다. GT vertex는
+진단 지표에만 사용하며 중심 고정/변위 규제/best 선택의 target으로 사용하지 않는다.
+
 Pippo 전체 원본은 동일한 pinned commit의 `external/pippo/` checkout에서 읽을 수 있다.
 `pippo_walkthrough.py`는 이 원본 class를 직접 호출하며 원본 source를 변경하지 않는다.
 본편의 cached module과 동일한 파일 hash를 확인하고, 기존 02 checkpoint도 읽어 검증한다.

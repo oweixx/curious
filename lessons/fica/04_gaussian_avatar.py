@@ -7,6 +7,7 @@ Private expression encoder 대신 FLAME100->256 adapter를 학습한다. Geometr
 Guide mesh supervision/normal/Laplacian을 사용하여 RGB만 맞추는 퇴화를 점검한다.
 
 CUDA_VISIBLE_DEVICES=0 python 04_gaussian_avatar.py --stage train
+CUDA_VISIBLE_DEVICES=0 python 04_gaussian_avatar.py --stage train --val-every 100 --val-frames 1
 CUDA_VISIBLE_DEVICES=0 python 04_gaussian_avatar.py --stage render --identity-source refined
 FiCA의 RGB UPM을 대상으로 하며 URAvatar의 조명/반사/별도 안구 모듈을 주장하지 않는다.
 """
@@ -15,10 +16,13 @@ import importlib.util
 import math
 from pathlib import Path
 import subprocess
+import time
 
+from PIL import Image, ImageDraw
 import torch
 from torch import nn
 import torch.nn.functional as F
+from tqdm.auto import tqdm
 
 spec = importlib.util.spec_from_file_location("fica_00", Path(__file__).with_name("00_prepare_nersemble.py"))
 L00 = importlib.util.module_from_spec(spec)
@@ -176,10 +180,15 @@ def render(gaussians, sample, background):
     return {"rgb":rgb,"alpha":alpha[:1],"normal":normal,"depth":depth,"radii":radii}
 
 
+def target_rgb(sample):
+    """이미 흰 배경으로 합성된 자료에 alpha를 두 번 적용하지 않는다."""
+    return sample["rgb"] if sample.get("rgb_composited_white",False) else sample["rgb"]*sample["alpha"]+1-sample["alpha"]
+
+
 def avatar_loss(config, rendered, gaussians, sample, bridge, perceptual=None):
     settings=config["upm"]
     target_alpha=sample["alpha"]
-    expected=sample["rgb"] if sample.get("rgb_composited_white",False) else sample["rgb"]*target_alpha+1-target_alpha
+    expected=target_rgb(sample)
     guide=gaussians["guide_vertices"]
     target=sample["local_vertices"]
     # Guide geometry와 실제 Gaussian 방향을 모두 감독한다. RGB만 좋아지는 퇴화를 점검한다.
@@ -207,7 +216,147 @@ def identity_input(data,row,device,source="target"):
     return value["texture"][None],value["xyz"][None]
 
 
-def train(config,data,device,steps,perceptual=True,resume=False):
+def validation_setup(data,device,limit=1,sources=("target","refined"),portrait_frame=None):
+    """고정 held-out driving frames + train split의 한 portrait를 선택한다.
+
+    Target은 UPM 자체를, refined는 03까지 연결한 조건을 평가한다. UV는 한 번만
+    읽어 고정하므로 학습 중 03 export가 바뀌어도 validation 조건은 변하지 않는다.
+    """
+    if limit < 0 or not sources or len(set(sources))!=len(sources) or any(s not in ("target","generated","refined") for s in sources):
+        raise ValueError("val-frames >= 0, 중복 없는 val-sources가 필요하다.")
+    rows=data.samples("validation")
+    if not rows:
+        raise ValueError("validation split이 없다. Train frame으로 대체하지 않는다.")
+    rows=rows[:limit] if limit else rows
+    portraits={}
+    for row in data.samples("train"):
+        if row["identity"] not in portraits and (portrait_frame is None or row["frame"]==portrait_frame):
+            portraits[row["identity"]]=row
+    inputs={source:{} for source in sources}
+    for key in dict.fromkeys(row["identity"] for row in rows):
+        if key not in portraits:
+            raise ValueError(f"identity {key}에 train split의 고정 portrait가 없다.")
+        reference=portraits[key]
+        for source in sources:
+            path=(data.path/"identities"/f"{key}.pt" if source=="target" else
+                  data.path/source/f"{Path(reference['file']).stem}.pt")
+            if not path.is_file():
+                raise FileNotFoundError(f"validation {source} UV가 없다: {path}. --val-sources target으로 UPM만 평가할 수 있다.")
+            texture,xyz=identity_input(data,reference,device,source)
+            inputs[source][key]={"texture":texture.detach(),"xyz":xyz.detach(),"portrait":reference["file"],
+                                "path":str(path),"sha256":L00.sha256(path)}
+    return rows,inputs
+
+
+def validation_manifest(inputs):
+    return {source:{key:{name:value for name,value in entry.items() if name not in ("texture","xyz")}
+                    for key,entry in group.items()} for source,group in inputs.items()}
+
+
+def save_validation_panel(path,images,titles,step,row,metrics,manifest,frame_count):
+    """0/100/200.jpg 한 장에 모든 조건을 비교한다. 사진 종횡비는 letterbox로 보존한다."""
+    side,label,columns=260,28,4
+    header=76+len(metrics)*20
+    canvas=Image.new("RGB",(columns*side,header+math.ceil(len(images)/columns)*(side+label)),(24,24,24))
+    draw=ImageDraw.Draw(canvas)
+    draw.text((10,8),f"04 | optimizer step {step} | held-out {Path(row['file']).stem}",fill="white")
+    reference=next(iter(manifest.values()))[row["identity"]]["portrait"]
+    draw.text((10,27),f"Fixed train portrait: {Path(reference).stem} | {frame_count} validation frame(s)",fill="white")
+    draw.text((10,46),"Same first held-out frame is displayed; metrics are means over selected frames.",fill="white")
+    for index,(source,values) in enumerate(metrics.items()):
+        draw.text((10,66+index*20),f"{source}: loss={values['loss']:.4f} | photo={values['photo']:.5f} | "
+                  f"PSNR={values['psnr']:.2f} | mask={values['mask']:.5f} | geometry={values['geometry']:.5f}",fill="white")
+    for index,(value,title) in enumerate(zip(images,titles)):
+        value=value.detach().float().cpu().expand(3,-1,-1)
+        array=(value.clamp(0,1).permute(1,2,0).numpy()*255).round().astype("uint8")
+        tile=Image.fromarray(array)
+        scale=min(side/tile.width,side/tile.height)
+        tile=tile.resize((max(1,round(tile.width*scale)),max(1,round(tile.height*scale))),Image.Resampling.BILINEAR)
+        x,y=index%columns*side,header+index//columns*(side+label)
+        draw.text((x+5,y+6),title,fill="white")
+        canvas.paste(tile,(x+(side-tile.width)//2,y+label+(side-tile.height)//2))
+    path.parent.mkdir(parents=True,exist_ok=True)
+    canvas.save(path,quality=95)
+
+
+@torch.no_grad()
+def validate(config,data,model,device,rows,inputs,out,step,perceptual=None):
+    """고정 identity UV로 held-out 표정/카메라를 평가한다. 학습 RNG/모드를 복원한다."""
+    if not rows:
+        raise ValueError("validation frame이 없다.")
+    mean,std=L00.lesson(3).stats(data,device)
+    totals={source:{} for source in inputs}
+    biases={}
+    preview_images,preview_titles=[],[]
+    depth_range=None
+    was_training=model.training
+    model.eval()
+    try:
+        with torch.random.fork_rng(devices=[device]):
+            for index,row in enumerate(rows):
+                sample=data.sample(row,device)
+                bridge=data.bridge(row["identity"],device)
+                expected=target_rgb(sample)
+                if index==0:
+                    # 같은 driving frame의 tracked mesh로 표시 범위만 정한다.
+                    # 매번 예측 depth의 min/max를 쓰면 학습 중 변화를 비교할 수 없다.
+                    camera=sample["posed_vertices"]@sample["w2c"][:3,:3].T+sample["w2c"][:3,3]
+                    depth=-camera[:,2]
+                    near,far=float(depth.min()),float(depth.max())
+                    margin=max((far-near)*.1,.01)
+                    depth_range=(near-margin,far+margin)
+                for source,group in inputs.items():
+                    entry=group[row["identity"]]
+                    texture,xyz=entry["texture"],entry["xyz"]
+                    token=(source,row["identity"])
+                    with torch.autocast("cuda",dtype=torch.bfloat16):
+                        if token not in biases:
+                            biases[token]=model.encode_identity(texture,xyz,mean,std)
+                        raw=model(texture,xyz,mean,std,*driving(sample),biases=biases[token])
+                    gs=decode(raw,texture,bridge,sample,config)
+                    rendered=render(gs,sample,torch.ones(3,device=device))
+                    loss,terms=avatar_loss(config,rendered,gs,sample,bridge,perceptual)
+                    if not all(torch.isfinite(value).all() for value in (loss,rendered["rgb"],rendered["alpha"],rendered["normal"],rendered["depth"])):
+                        raise FloatingPointError(f"04 validation NaN/Inf: {source} {row['file']}")
+                    mse=F.mse_loss(rendered["rgb"],expected)
+                    values={"loss":float(loss),**{name:float(value) for name,value in terms.items()},
+                            "psnr":float(-10*mse.clamp_min(1e-10).log10()),"gaussians":len(gs["position"]),
+                            "visible_gaussians":int((rendered["radii"]>0).sum())}
+                    for name,value in values.items():
+                        totals[source][name]=totals[source].get(name,0.)+value
+                    if index==0:
+                        error=((rendered["rgb"]-expected).abs().mean(0,keepdim=True)/.25).clamp(0,1)
+                        heatmap=torch.cat((error,1-(2*error-1).abs(),1-error),0)
+                        alpha=rendered["alpha"].clamp(0,1)
+                        normal=(rendered["normal"]*.5+.5)*alpha+1-alpha
+                        ratio=((rendered["depth"]-depth_range[0])/(depth_range[1]-depth_range[0])).clamp(0,1)
+                        depth_color=torch.cat((ratio,1-(2*ratio-1).abs(),1-ratio),0)*alpha+1-alpha
+                        preview_images.extend([expected,rendered["rgb"],heatmap,texture[0],sample["alpha"],alpha,normal,depth_color])
+                        preview_titles.extend([f"{source}: reference",f"{source}: Gaussian RGB",f"{source}: error (red >= 0.25)",f"{source}: fixed portrait UV",
+                            f"{source}: reference alpha",f"{source}: Gaussian alpha",f"{source}: world normal",f"{source}: depth [{depth_range[0]:.3f}, {depth_range[1]:.3f}]"])
+        metrics={source:{name:value/len(rows) for name,value in values.items()} for source,values in totals.items()}
+        manifest=validation_manifest(inputs)
+        directory=out/"validation"
+        save_validation_panel(directory/f"{step}.jpg",preview_images,preview_titles,step,rows[0],metrics,manifest,len(rows))
+        L00.append_log(directory/"metrics.jsonl",{"step":step,"metrics":metrics,"frames":[row["file"] for row in rows],
+            "preview_frame":rows[0]["file"],"fixed_identity_inputs":manifest,"lpips_enabled":perceptual is not None,
+            "depth_display_range":depth_range,"scope":data.manifest["scope"],
+            "geometry_target":"tracking-derived FLAME local vertices; supervision/metrics only",
+            "photo_psnr_target":"full image with white matting composite; per-frame metrics averaged"})
+        return metrics
+    finally:
+        model.train(was_training)
+
+
+def train(config,data,device,steps,perceptual=True,resume=False,val_every=100,val_frames=1,
+          val_sources=("target","refined"),portrait_frame=None):
+    if steps<1 or val_every<1:
+        raise ValueError("steps/val-every는 1 이상이어야 한다.")
+    rows,inputs=validation_setup(data,device,val_frames,val_sources,portrait_frame)
+    out=L00.work_root(config)/"outputs/04"
+    path=L00.work_root(config)/"checkpoints/04/latest.pt"
+    if path.exists() and not resume and config.get("profile")!="smoke":
+        raise FileExistsError(f"{path}가 있다. --resume로 이어서 학습하세요.")
     model=UniversalPrior(config).to(device).train()
     optimizer=torch.optim.AdamW(model.parameters(),lr=config["upm"]["lr"])
     loss_network=None
@@ -216,38 +365,55 @@ def train(config,data,device,steps,perceptual=True,resume=False):
         loss_network=lpips.LPIPS(net="vgg").to(device).eval().requires_grad_(False)
     mean,std=L00.lesson(3).stats(data,device)
     bridges={}
-    rows=data.samples("train")
-    start=L00.training_start(L00.work_root(config)/"checkpoints/04/latest.pt",model,optimizer,config,data,resume)
+    start=L00.training_start(path,model,optimizer,config,data,resume)
+    if start>=steps:
+        raise ValueError(f"이미 {start} step이다. --steps는 추가 횟수가 아닌 총 목표이므로 더 큰 값을 지정하세요.")
+    validation_info={"frames":[row["file"] for row in rows],"inputs":validation_manifest(inputs),"lpips_enabled":bool(perceptual)}
+    if resume:
+        state=torch.load(path,map_location="cpu",weights_only=True,mmap=True)
+        if state["extra"].get("validation")!=validation_info:
+            raise ValueError("resume 중 validation frame/portrait/UV가 바뀌었다. 같은 조건을 사용하세요.")
+        del state
     accumulation=config["training"]["grad_accumulation"]
-    for step in range(start,steps):
-        optimizer.zero_grad(set_to_none=True)
-        mean_loss=0.;mean_terms={}
-        for micro in range(accumulation):
-            row=data.training_row()
-            if row["identity"] not in bridges:
-                bridges[row["identity"]]=data.bridge(row["identity"],device)
-            bridge=bridges[row["identity"]]
-            sample=data.sample(row,device)
-            texture,xyz=identity_input(data,row,device,"target")
-            with torch.autocast("cuda",dtype=torch.bfloat16):
-                raw=model(texture,xyz,mean,std,*driving(sample))
-            gaussians=decode(raw,texture,bridge,sample,config)
-            rendered=render(gaussians,sample,torch.ones(3,device=device))
-            loss,terms=avatar_loss(config,rendered,gaussians,sample,bridge,loss_network)
-            (loss/accumulation).backward()
-            mean_loss+=float(loss.detach())/accumulation
-            for name,value in terms.items():
-                mean_terms[name]=mean_terms.get(name,0.)+float(value.detach())/accumulation
-        report=L00.gradients(model)
-        torch.nn.utils.clip_grad_norm_(model.parameters(),config["training"]["clip_grad"])
-        optimizer.step()
-        L00.append_log(L00.work_root(config)/"outputs/04/training.jsonl",{"step":step+1,"loss":mean_loss,"terms":mean_terms,"gradient":report})
-        print(f"04 step {step+1}/{steps}: {mean_loss:.6f}",flush=True)
-        if (step+1)%config["training"]["preview_every"]==0 or step==0:
-            L00.save_panels(L00.work_root(config)/"outputs/04/preview"/f"{step+1}.jpg",[sample["rgb"],rendered["rgb"],rendered["normal"]*.5+.5,rendered["alpha"]],
-                            ["Reference","3DGS render","World normal","Alpha"])
-        if (step+1)%config["training"]["checkpoint_every"]==0 or step==steps-1:
-            L00.checkpoint(L00.work_root(config)/"checkpoints/04/latest.pt",model,optimizer,config,data,step+1)
+    with tqdm(total=steps,initial=start,desc="04 Gaussian avatar",unit="step",dynamic_ncols=True,mininterval=1) as bar:
+        recent=validate(config,data,model,device,rows,inputs,out,start,loss_network)
+        for step in range(start,steps):
+            started=time.perf_counter()
+            optimizer.zero_grad(set_to_none=True)
+            mean_loss=0.;mean_terms={}
+            for micro in range(accumulation):
+                row=data.training_row()
+                if row["identity"] not in bridges:
+                    bridges[row["identity"]]=data.bridge(row["identity"],device)
+                bridge=bridges[row["identity"]]
+                sample=data.sample(row,device)
+                texture,xyz=identity_input(data,row,device,"target")
+                with torch.autocast("cuda",dtype=torch.bfloat16):
+                    raw=model(texture,xyz,mean,std,*driving(sample))
+                gaussians=decode(raw,texture,bridge,sample,config)
+                rendered=render(gaussians,sample,torch.ones(3,device=device))
+                loss,terms=avatar_loss(config,rendered,gaussians,sample,bridge,loss_network)
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(f"04 training loss NaN/Inf at step {step+1}")
+                (loss/accumulation).backward()
+                values=torch.stack([loss.detach(),*[value.detach() for value in terms.values()]]).cpu().tolist()
+                mean_loss+=values[0]/accumulation
+                for name,value in zip(terms,values[1:]):
+                    mean_terms[name]=mean_terms.get(name,0.)+value/accumulation
+            norm=torch.nn.utils.clip_grad_norm_(model.parameters(),config["training"]["clip_grad"],error_if_nonfinite=True)
+            report={"norm":float(norm),"tensors":sum(p.grad is not None for p in model.parameters())}
+            optimizer.step()
+            torch.cuda.synchronize(device)
+            L00.append_log(out/"training.jsonl",{"step":step+1,"loss":mean_loss,"terms":mean_terms,
+                "gradient":report,"step_seconds":time.perf_counter()-started})
+            if (step+1)%val_every==0 or step==steps-1:
+                recent=validate(config,data,model,device,rows,inputs,out,step+1,loss_network)
+            display={"loss":f"{mean_loss:.5f}"}
+            display.update({f"val_{source}":f"{values['photo']:.5f}" for source,values in recent.items()})
+            bar.set_postfix(display,refresh=False)
+            bar.update(1)
+            if (step+1)%config["training"]["checkpoint_every"]==0 or step==steps-1:
+                L00.checkpoint(path,model,optimizer,config,data,step+1,extra={"validation":validation_info})
     return model.eval()
 
 
@@ -261,7 +427,7 @@ def render_sequence(config,data,model,device,source="refined",portrait_frame=Non
             references[row["identity"]]=row
     current_identity=None
     out=L00.work_root(config)/"outputs/04"/source
-    for i,row in enumerate(data.manifest["samples"]):
+    for i,row in enumerate(tqdm(data.manifest["samples"],desc=f"04 Render {source}",unit="frame",dynamic_ncols=True)):
         if row["identity"] not in bridges:
             bridges[row["identity"]]=data.bridge(row["identity"],device)
         sample=data.sample(row,device)
@@ -288,19 +454,34 @@ def render_sequence(config,data,model,device,source="refined",portrait_frame=Non
 
 def main():
     parser=L00.arguments(__doc__)
-    parser.add_argument("--stage",choices=("train","render"),default="train")
+    parser.add_argument("--stage",choices=("train","render","validate"),default="train")
     parser.add_argument("--identity-source",choices=("target","generated","refined"),default="refined")
     parser.add_argument("--portrait-frame",type=int,help="identity마다 고정할 reference frame; 기본은 첫 frame")
+    parser.add_argument("--val-every",type=int,default=100,help="고정 validation 주기. 기본 100 optimizer steps")
+    parser.add_argument("--val-frames",type=int,default=1,help="고정 held-out frame 수. 기본 1, 0이면 전체")
+    parser.add_argument("--val-sources",nargs="+",choices=("target","generated","refined"),default=["target","refined"],
+                        help="validation의 identity UV 조건. 기본 target refined")
     args=parser.parse_args()
     config=L00.read_config(args.config,args.smoke)
     device=L00.setup_device(args.device,config["seed"])
     data=L00.PreparedData(args.data)
     if args.stage=="train":
-        train(config,data,device,args.steps or config["training"]["steps"],resume=args.resume)
+        train(config,data,device,args.steps or config["training"]["steps"],resume=args.resume,
+              val_every=args.val_every,val_frames=args.val_frames,val_sources=args.val_sources,portrait_frame=args.portrait_frame)
     else:
         model=UniversalPrior(config).to(device).eval()
-        L00.restore(L00.work_root(config)/"checkpoints/04/latest.pt",model,config,data)
-        render_sequence(config,data,model,device,args.identity_source,args.portrait_frame)
+        state=L00.restore(L00.work_root(config)/"checkpoints/04/latest.pt",model,config,data)
+        step=state["step"]
+        del state
+        if args.stage=="render":
+            render_sequence(config,data,model,device,args.identity_source,args.portrait_frame)
+        else:
+            import lpips
+            perceptual=lpips.LPIPS(net="vgg").to(device).eval().requires_grad_(False)
+            rows,inputs=validation_setup(data,device,args.val_frames,args.val_sources,args.portrait_frame)
+            out=L00.work_root(config)/"outputs/04"
+            validate(config,data,model,device,rows,inputs,out,step,perceptual)
+            print("04 validation:",out/"validation"/f"{step}.jpg")
 
 
 if __name__=="__main__":

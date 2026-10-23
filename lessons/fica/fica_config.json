@@ -9,18 +9,21 @@
   "sapiens": {"width": 1536, "depth": 40, "heads": 24, "head_width": 384, "input_size": [1024, 768], "augmentation": true, "encoder_lr": 0.000005, "head_lr": 0.00005, "checkpoint_blocks": true},
   "uv_repair": {"steps": 3000, "warmup_steps": 100, "encoder_lr": 1e-06, "head_lr": 1e-05, "validity_lr": 0.001, "validity_weight": 0.05, "dice_weight": 0.5, "validity_threshold": 0.7, "max_uv_edge": 0.03, "checkpoint_every": 1000},
   "diffusion": {"width": 1792, "depth": 28, "heads": 28, "patch_size": 2, "latent_pack": 2, "clip_dim": 768, "sample_steps": 50, "lr": 0.0001, "weight_decay": 0.01, "checkpoint_blocks": true},
-  "refinement": {"channels": [320, 640, 1280, 1280], "layers_per_block": 2, "attention_head_dim": 8, "lr": 0.0001, "photo": 2.0, "mask": 0.5, "keypoint": 0.01, "regularization": 1.0},
+  "geometry_repair": {"steps": 2000, "xyz_scale": 3.0, "lr": 0.00001, "warmup_steps": 100, "geometry_every": 4, "geometry_weight": 0.25, "vertex_weight": 0.5, "edge_weight": 0.1, "checkpoint_every": 500},
+  "refinement": {"channels": [320, 640, 1280, 1280], "layers_per_block": 2, "attention_head_dim": 8, "attention_max_size": 64, "steps": 1000, "val_every": 100, "val_frames": 0, "checkpoint_every": 100, "lr": 0.00003, "photo": 2.0, "mask": 0.5, "keypoint": 0.01, "regularization": 1.0, "objective": "surface_refinement_v2", "texture_reg_weight": 0.1, "laplacian_reg_weight": 1.0, "normal_reg_weight": 1.0, "geometry_reg_weight": 0.25, "geometry_anchor_scale": 0.01},
   "upm": {"channels": [256, 256, 256, 128, 128, 64, 32], "expression_dim": 256, "lr": 0.0005, "photo": 10.0, "mask": 2.0, "lpips": 0.2, "geometry": 20.0, "normal": 0.2, "laplacian": 1.0, "offset": 0.01, "max_offset": 0.05},
   "training": {"steps": 50000, "batch_size": 1, "grad_accumulation": 1, "preview_every": 100, "checkpoint_every": 1000, "clip_grad": 1.0},
   "implementation_choices": {
     "diffusion_width": "1792/28 heads is a documented width choice; FiCA reports 28 blocks and about 2B parameters but not width/head count.",
     "latent_pack": "SDXL 512->64x64x4; invertible pixel_unshuffle(2)->32x32x16 reconciles supplementary dimensions. Packing is not specified in FiCA.",
     "clip": "OpenAI CLIP ViT-L/14 selected; exact CLIP checkpoint is not specified by FiCA.",
-    "refiner_channels": "Diffusers UNet2DConditionModel default channel schedule; exact FiCA U-Net configuration is unpublished.",
+    "refiner_channels": "Diffusers UNet2DConditionModel with the default channel widths, full-resolution convolution/skip connections and self/cross-attention only at resolutions <=64. Exact FiCA U-Net configuration is unpublished; this attention placement and the 1K-step single-identity default are our choices, not a released FiCA architecture/training recipe.",
     "refiner_laplacian": "Row-L1 normalized geometry-dependent cotangent matrix, to bound skinny-triangle weights; FiCA does not publish the Laplacian definition/reduction.",
+    "refiner_quality": "Our fixed mesh-centroid constraint, foreground-normalized photo L1, texture MSE with weight 0.1 and initial-mesh displacement penalty (weight 0.25, world scale 0.01). These compensate for measured translation drift and suppressed texture updates in our single-identity experiment; they are not released FiCA loss reductions/weights. Best is selected by mean held-out total loss, without GT vertex error in the objective/selection.",
     "upm": "FiCA identity bias pyramid + driving decoder, following URAvatar; layer widths are an implementation choice, not a released FiCA architecture.",
     "driving": "NeRSemble FLAME expression->learned 256D adapter, eye axis-angle->gaze vectors; not the private Codec Avatar expression encoder.",
     "uv_repair": "Our auxiliary foreground head (384->64->1), balanced BCE/Dice, FP32 UV decoder and source-grid triangulation. These details are not released FiCA code. XYZ/normal weights stay fixed.",
+    "geometry_repair": "Our XYZ/std/3 codec normalization, complete geometry-latent supervision (outside atlas is known padding), decoded endpoint XYZ/vertex/edge losses, and template-relative Laplacian MeshBridge (lambda=10). Not released FiCA implementation details; DiT/ControlMLP architecture and frozen SDXL VAE weights are unchanged.",
     "supervision": "FLAME-derived canonical geometry and train-view UV observations are pseudo targets. Missing texture is excluded from supervised losses.",
     "smoke": "Only smoke overrides width/depth/resolution. Pretrained Sapiens-1B, SDXL VAE and CLIP remain real external models."
   }

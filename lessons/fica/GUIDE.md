@@ -9,7 +9,7 @@
 | 00 | `00_prepare_nersemble.py` | 이미지·camera·canonical mesh의 대응이 맞는가? | `prepare_dataset`, `rasterize_labels`, `MeshBridge` |
 | 01 | `01_partial_uv.py` | RGB 한 장의 픽셀을 어디의 UV texel로 옮기는가? | `DensePredictor`, `UVValidityPredictor`, `train_uv_repair`, `resample_partial_uv` |
 | 02 | `02_generate_uv.py` | 불완전한 관측에서 texture/geometry 전체를 어떻게 생성하는가? | `FrozenConditioners`, `UVFlowModel`, `flow_loss`, `sample_domains` |
-| 03 | `03_refine_uv.py` | 이미지의 오차를 어떤 UV 수정으로 연결하는가? | `RefinementNet`, `feature_pair`, `refinement_loss` |
+| 03 | `03_refine_uv.py` | 이미지의 오차를 어떤 UV 수정으로 연결하는가? | `RefinementNet`, `constrain_geometry`, `refinement_loss`, `validate` |
 | 04 | `04_gaussian_avatar.py` | Identity를 유지하면서 표정에 맞는 Gaussians를 만드는가? | `IdentityEncoder`, `UniversalPrior`, `decode`, `render` |
 
 아래 명령의 기준 디렉터리는 `/media/vilab/mh/curious/lessons/fica`다. 기존 **conda elite**를
@@ -23,7 +23,7 @@
 | Partial UV | RGB3 + mask1 + normal3 + XYZ3 | Bilinear forward splat, alpha/UV 범위로 visibility 판정 |
 | UV generation | Frozen SDXL VAE, CLIP image conditioning, 28 DiT+ControlMLP blocks, shared texture/geometry model, domain switcher, flow matching, 기본 50-step sampling | width1792/28 heads로 약 1.97B, CLIP ViT-L/14, linear conditional flow/Euler |
 | Latent | SDXL VAE 8배 공간 압축과 논문의 32×32×16 latent 표기 | 64×64×4를 가역적인 pixel-unshuffle(2)로 packing; packing은 논문에 미기재 |
-| UV refinement | 실제 Diffusers conditional U-Net, reference/render의 실제 Sapiens feature, cross-attention, Eq.2의 loss 종류와 2/.5/.01/1 가중치 | U-Net 채널은 공개 기본값, residual 출력, reference/render type embedding, loss reduction |
+| UV refinement | 실제 Diffusers conditional U-Net, reference/render의 실제 Sapiens feature, cross-attention, photo/mask/keypoint와 texture/Laplacian/normal 규제 | 공개 기본 채널 폭, 저해상도 attention, residual 출력, feature type embedding, 중심 고정·foreground 평균·texture MSE·초기 geometry 변위 규제 |
 | UPM | UV-conditioned identity hypernetwork의 multi-scale bias를 decoder 각 층에 더함; expression/view/gaze conditioning; 3축 scale의 실제 3DGS | 22.4M인 자체 채널 설정, FLAME100→256 expression adapter, learned guide, 고정 root pose adapter, 명시적인 geometry supervision |
 
 **VAE와 CLIP, frozen feature encoder는 학습하지 않는다.** 01의 세 predictor는 encoder와
@@ -391,17 +391,86 @@ ablation이며 기본값은 항상 `predicted`다. 어떤 경로인지 cache와 
 domain=0/1로 두 번 평가한다. CLIP+time+domain은 전역 modulation, partial UV는 위치별
 ControlMLP로 전달한다. Sampling은 noise에서 data 방향으로 Euler 적분한다.
 
-`outputs/02/*.jpg`는 입력 사진 / 생성 mesh render / 생성 texture / XYZ 표시다.
+`outputs/02/predictions/*.jpg`는 입력 사진 / 생성 mesh render / 생성 texture / XYZ 표시다.
 `generated/*.pt`에는 실제 float UV와 sampling 중간 latent가 있다. XYZ의 RGB 표시는
 시각화일 뿐이며 표시 이미지를 mesh 좌표로 사용하지 않는다. VAE 재구성 자체의 geometry
 오차도 별도로 검사해야 한다. 원본 모델처럼 unseen identity를 생성하려면 여러 identity의
 학습이 필요하고, 한 사람 overfit만으로 이 능력을 주장할 수 없다.
 
+### XYZ가 찢어질 때: 기존 weight 안정화와 geometry 추가 학습
+
+50K 모델 진단에서 정답 geometry latent를 SDXL VAE로 decode하는 것만으로도
+XYZ 오차가 생겼다. 또한 작은 UV triangle에 대응하는 vertex의 least-squares 해가
+이 오차를 증폭했다. 현재 `MeshBridge`는 아래 식으로 template에 대한 변위를 안정화한다.
+
+```text
+min_V ||AV - XYZ||² + 1e-4 ||V - V_base||² + 10 ||L(V - V_base)||²
+```
+
+`L`은 vertex 이웃의 평균을 빼는 uniform Laplacian이다. `V_base`는 개인의 정답 mesh가
+아닌 공개 FLAME base이며, inference에서 GT geometry로 바꿔치기하지 않는다.
+이 변경은 02 render와 이후 03/04에도 같은 `PreparedData.bridge`를 통해 적용된다.
+`MeshBridge(..., laplacian=0)`으로 기존 방식과 비교할 수 있다.
+
+기존 50K weight/cache 그대로 안정화된 결과만 먼저 확인하려면:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python 02_generate_uv.py --stage stabilize
+```
+
+이미지는 `outputs/02/stabilized/predictions/`, tensor는 `data/prepared/generated_stabilized/`에
+저장한다. 원래 checkpoint, latent cache, validation 이미지를 덮어쓰지 않는다.
+
+추가 학습은 `geometry_repair` run에서 진행한다. DiT/ControlMLP 구조와 frozen SDXL VAE는
+같고, 기존 50K weight를 초기값으로 사용한다. 새 optimizer/step으로 2,000 step을 학습한다.
+
+- XYZ normalization: `(XYZ - mean) / (3 * std)`. Inverse에서도 같은 3을 곱한다.
+  RGB/normal/mask의 전처리와 texture VAE는 그대로다. 입력을 hard clip하지 않는다.
+- Geometry target latent는 atlas 밖의 알려진 padding까지 감독한다. 실제 surface의 미관측
+  texture를 검정 정답으로 쓰는 것은 아니며, texture loss는 관측 mask를 계속 사용한다.
+- 첫 100 step은 flow loss로 새 latent 분포에 적응한다. 이후 4 step마다 같은 DiT의
+  `x_1_hat = x_t + (1-t) * v_hat`를 VAE로 decode하고, valid XYZ L1과 mesh vertex/edge
+  오차를 추가한다. VAE parameter는 고정하지만 latent로의 gradient는 유지한다.
+- 이 normalization, auxiliary loss, Laplacian 복원은 우리 재현의 보완이며 FiCA 저자의
+  공개되지 않은 세부 구현과 동일하다고 주장하지 않는다.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python 02_generate_uv.py --stage codec-check
+CUDA_VISIBLE_DEVICES=0 python 02_generate_uv.py --stage finetune-geometry
+# 중단된 동일 run을 계속 학습하려면:
+CUDA_VISIBLE_DEVICES=0 python 02_generate_uv.py --stage finetune-geometry --resume
+```
+
+`finetune-geometry`는 학습 전에 실제 XYZ→VAE→mesh 왕복 오차를 검사하고, 필요한 새
+cache를 자동으로 준비한다. Codec의 평균 vertex 오차가 head 크기의 5%를 넘으면 본 학습을
+시작하지 않는다. 이는 최소한의 이상 감지이며 품질을 보장하는 기준은 아니다.
+새 cache는 `data/prepared/latents/geometry_repair/`, checkpoint는
+`checkpoints/02/geometry_repair/latest.pt`, 비교 이미지는
+`outputs/02/geometry_repair/validation/0.jpg`, `100.jpg`, … 에 저장한다.
+`codec_check.json/jpg`에는 DiT와 무관한 codec 왕복 기준선이 있다.
+
+Validation에는 UV 오차 외에 vertex RMSE/최대 오차, 정답 대비 10배 이상 늘어난 edge 수도
+기록한다. 고정 frame/noise seed와 학습 RNG 복원은 유지한다. 새 학습 완료 후에는 모든
+frame을 `data/prepared/generated/`로 export하여 03이 읽게 한다. World 좌표인 `xyz`와
+진단용 mesh projection인 `xyz_surface`를 함께 저장하며 실제 texture/XYZ 예측에 GT는
+사용하지 않는다. Render는 이전처럼 준비된 tracking pose adapter를 사용한다.
+생성 결과를 바꾼 뒤에는 03 feature cache도 다시 만들어야 한다.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python 02_generate_uv.py --stage sample --run-name geometry_repair
+CUDA_VISIBLE_DEVICES=0 python 03_refine_uv.py --stage cache
+```
+
+`--steps 4000`은 새 run의 총 목표 step을 뜻한다. 기본 2,000 step 이후 더 이어갈 때는
+`--resume --steps 4000`을 사용한다. `--init-from /path/to/latest.pt`는 weight만 가져오는
+새 run의 초기화이며 optimizer resume와 다르다. Cache의 codec/partial fingerprint가
+맞지 않으면 학습·sampling을 중단해 이전 전처리와 섞이는 것을 막는다.
+
 ## 03 — 보정이 texture와 geometry를 어떻게 바꾸는지 보기
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python 03_refine_uv.py --stage cache
-CUDA_VISIBLE_DEVICES=0 python 03_refine_uv.py --stage train
+CUDA_VISIBLE_DEVICES=0 python 03_refine_uv.py --stage train --run-name quality_repair --init-from checkpoints/03/latest.pt --steps 1000
 CUDA_VISIBLE_DEVICES=0 python 03_refine_uv.py --stage predict
 ```
 
@@ -409,8 +478,22 @@ CUDA_VISIBLE_DEVICES=0 python 03_refine_uv.py --stage predict
 U-Net의 UV queries가 두 이미지의 tokens를 cross-attend한다. 시간 입력은 0이며 별도의
 diffusion sampling을 하지 않는다. 출력은 texture/XYZ residual이다.
 
+입출력 UV는 모두 512×512다. 채널 폭은 `[320, 640, 1280, 1280]`을 유지하고,
+512→256→128 구간은 convolution/skip connection, 64×64 구간과 bottleneck은
+self-attention 및 Sapiens image feature와의 cross-attention을 사용한다. Up path는
+64→128→256→512로 복원하며 고해상도 skip을 합친다. UV 전체를 64로 축소하거나,
+작은 residual을 interpolation으로 확대하는 방식이 아니다.
+
+이전 배치는 512×512에서도 global self-attention을 수행하여 head 하나당 약 687억
+query/key 쌍을 처리했다. 64×64에서의 쌍 수는 그 1/4096이지만 전체 학습 속도가
+4096배가 되는 것은 아니다. 고해상도 convolution, gradient, rendering은 계속 필요하다.
+`refinement.attention_max_size=64`가 이 배치를 정한다. FiCA는 세부 attention 배치를
+공개하지 않았으므로 이 변경은 우리의 구현 선택이다. 기존 attention 배치의 03 checkpoint와
+구조가 달라 weight/optimizer를 그대로 재개할 수 없다. 01/02 출력과 Sapiens feature cache는
+생성 UV가 동일하면 그대로 사용한다.
+
 Image L1, alpha mask, pixel 단위 2D landmark L1과 초기 texture·cotangent Laplacian matrix·
-vertex normal의 L2 regularization을 사용한다. Loss reduction/정규화는 구현 선택이며
+vertex normal의 regularization을 사용한다. Loss reduction/정규화는 구현 선택이며
 정확한 저자 implementation과 동일하다고 주장하지 않는다. Geometry의 Cholesky solve,
 posing, CUDA rasterizer까지 gradient가 보존된다. 생성 UV가 바뀌면 기존 feature cache는
 hash mismatch로 거부한다. 먼저 `cache`를 다시 실행한다.
@@ -420,13 +503,96 @@ Laplacian은 geometry-dependent cotangent matrix의 각 row를 L1 정규화한 �
 행렬은 여전히 현재 geometry에 따라 변하고 gradient가 흐른다. 정확한 Laplacian 정의와
 reduction은 FiCA에 공개되지 않았으므로 이 정규화를 저자 설정으로 주장하지 않는다.
 
-`outputs/03/preview/100.jpg` 등의 비교와 각 loss 항을 함께 읽는다. 최종 UV는 `refined/`다.
-Photometric loss 감소만으로 geometry 개선을 판단하지 않는다.
+학습은 tqdm 한 줄에 loss, 최근 validation photo L1, 진행률/속도/예상 시간을 표시한다.
+개별 loss 항·gradient norm·validation/checkpoint를 제외한 optimizer step 소요시간은
+`outputs/03/training.jsonl`에만 기록한다. 수백 개 gradient tensor마다 CPU로 동기화하던
+debug 검사는 전체 gradient norm의 NaN/Inf 검사와 clipping으로 합쳤다.
+
+기존 1K 실험에서는 texture 변화가 RGB 0~1 기준 평균 약 0.00026에 머물렀고, geometry
+변위 에너지의 약 99.4%가 전체 translation이었다. `surface_refinement_v2`는 이 관찰을
+보완하는 **우리의 loss/제약 변경**이며 FiCA 저자가 공개한 세부 설정이 아니다.
+
+1. `constrain_geometry`: mesh의 중심을 초기 생성 mesh와 일치시킨다. UV texel 평균과
+   vertex 평균은 다르므로, MeshBridge 선형부의 계수로 중심 변화량을 구한다.
+   보정 UV에서 이 translation을 빼며 gradient는 Network까지 전달한다. GT mesh로
+   위치를 맞추거나 geometry를 바꾸는 과정이 아니다. 3개 translation 자유도만 제거한다.
+2. `photo`: 관측 FLAME 얼굴 mask 안에서 RGB L1을 평균한다. 쉬운 배경 pixel이 오차를
+   희석하지 않도록 한다. 이전 전체 이미지 기준 지표는 `photo_full`로 따로 보존한다.
+   이전 run의 `photo`와 새 run의 `photo_full`을 비교해야 같은 정의다.
+3. `texture_reg`: pixel별 vector norm 대신 유효 UV의 RGB MSE를 사용하고 가중치를
+   0.1로 둔다. 작은 보정에서는 규제 gradient도 작아져 사진에 맞춘 색 수정을 허용한다.
+4. `geometry_reg`: 초기 생성 vertex로부터의 변위 제곱을 0.01 world 단위로 정규화하고
+   가중치 0.25를 준다. 현재 FLAME 단위에서 0.01은 1 cm다. 전체 이동을 제거한 뒤에도
+   얼굴 형태가 임의로 크게 변하지 않게 한다. 초기 생성 mesh가 기준이며 GT geometry는
+   이 학습 항이나 best 선택에 사용하지 않는다.
+
+Photo/mask/keypoint의 바깥 가중치는 2/0.5/0.01, Laplacian/normal은 각각 1을 유지한다.
+Refiner Network/외부 Sapiens feature는 그대로이며, 새 run의 learning rate는 3e-5다.
+새 objective와 기존 loss의 숫자는 직접 비교하지 않고, 같은 정의의 `photo_full`·mask·
+keypoint·geometry 지표를 함께 본다. 검증에는 vertex 중심 이동, 이동을 뺀 형태 변화 RMS,
+texture 평균 변화량도 기록한다. Coarse FLAME vertex RMSE는 계속 진단용이다.
+
+3번의 기본 학습량은 `refinement.steps=1000`이다. 원 논문의 50K-step 대규모 학습과 구별되는
+현재 단일 identity 실습 설정이다. Validation과 checkpoint의 기본 주기는 각각 100 step이다.
+Validation은 학습 전과 마지막에도 실행하고, 학습 frame으로 대체하지 않는다. 기본
+`val_frames=0`은 현재 held-out 7개 전체의 평균이며 표시는 같은 첫 frame으로 고정한다.
+
+```bash
+# 기존 weight만 가져와 별도 run을 시작한다. optimizer와 local step은 새로 시작한다.
+CUDA_VISIBLE_DEVICES=0 python 03_refine_uv.py --stage train --init-from checkpoints/03/latest.pt --steps 1000
+# 이미 quality_repair run이 있다면 총 목표 step까지 이어간다. init-from을 함께 쓰지 않는다.
+CUDA_VISIBLE_DEVICES=0 python 03_refine_uv.py --stage train --resume --steps 1000
+# 추론은 기본으로 best.pt를 사용한다. 마지막 모델 비교는 --weights latest.
+CUDA_VISIBLE_DEVICES=0 python 03_refine_uv.py --stage predict
+CUDA_VISIBLE_DEVICES=0 python 03_refine_uv.py --stage validate --weights best
+```
+
+CLI의 기본 `--run-name`은 `quality_repair`다. `outputs/03/quality_repair/validation/0.jpg`,
+`100.jpg`, `200.jpg`처럼 step별 JPEG 한 장을 저장한다. 기존 `outputs/03/validation/`과
+`checkpoints/03/latest.pt`는 비교용으로 그대로 보존한다.
+항상 같은 첫 validation frame의 reference, 초기/보정 mesh render, 동일 scale의 photo error,
+초기/보정 UV texture, XYZ 및 변화량을 비교한다. 사진 종횡비는 letterbox로 보존한다.
+`--val-frames`를 늘려도 이미지는 첫 frame으로 고정하고 지표는 선택한 frames의 평균이다.
+Validation의 RNG와 train/eval 모드는 복원하며 gradient/optimizer update를 수행하지 않는다.
+
+`validation/metrics.jsonl`에는 loss의 각 항, 초기 결과의 동일 지표, coarse FLAME target에 대한
+vertex RMSE를 남긴다. Vertex RMSE는 진단용이며 새 학습 loss로 추가하지 않는다.
+Photometric loss 감소와 geometry 변화를 함께 확인한다. 이 held-out frame 평가는 새로운
+identity에 대한 일반화 평가가 아니다.
+
+`checkpoints/03/quality_repair/latest.pt`는 optimizer/RNG를 포함한 학습 재개용이다.
+`best.pt`는 validation total loss가 가장 낮았던 weight만 보존하며 `best.json`에 step과
+지표를 기록한다. Best는 optimizer를 재개하는 파일이 아니다. `--steps`는 총 목표 횟수이며
+이미 해당 step에 도달한 checkpoint를 같은 steps로 재개하면 명시적으로 오류를 낸다.
+
+`predict`는 선택한 checkpoint와 동일한 중심 제약을 적용해 모든 frame의 보정 UV를
+`data/prepared/refined/`에 저장하고 04가 읽는다. 처음 quality run을 export할 때 기존
+legacy tensor들은 `data/prepared/refined_legacy_1000/`로 보존한다. 각 tensor에 run/checkpoint
+step과 objective를 기록하고, `outputs/03/quality_repair/predictions/`에는 실제 저장 UV의
+초기/보정 render 및 texture 비교 JPEG, 전체 frame 지표 `metrics.json`을 함께 남긴다.
+Predict는 추가 학습이 아니라 저장된 weight로 추론/export하는 단계다.
+
+2026-10-20 quality 보완 검증: 기존 1K weight에서 `quality_repair`를 200 step 학습하고,
+held-out 7개 validation total loss가 가장 낮은 150 step을 선택해 20개 frame을 export했다.
+같은 정의의 전체 이미지 L1은 기존 1K의 0.03909→0.03852, coarse vertex RMSE는
+0.01712→0.01014였다. Texture 평균 변화량은 약 0.00026→0.03194였고 vertex 중심 이동은
+약 1.7e-9 world 단위였다. 색상 수정/translation 억제를 확인했지만 눈·입의 검은 영역과
+coarse geometry는 남아 있다. 짧은 보완 검증을 최종 품질 수렴으로 해석하지 않는다.
+`repair_report.json`과 `predictions/`에 실제 export 평가가 있다. 위치 제약의 gradient,
+optimizer/RNG 재개, best weight 재로딩 및 04의 3DGS 연결 smoke도 통과했다.
+
+2026-10-20, GPU 0의 실제 512×512 / 약 813M refiner와 기존 생성 UV·Sapiens cache로
+5 optimizer step을 확인했다. Validation/checkpoint를 제외한 step 시간은 1.04~1.28초,
+첫 step을 제외한 중앙값은 1.08초였다. GPU는 다른 학습과 공유 중이었다. Self-attention의
+query 길이는 모든 layer에서 4096 이하였고, 512 입출력·condition 영향·checkpoint 재로딩을
+검증했다. 이는 짧은 속도/동작 검사이며 수렴이나 최종 품질 검증이 아니다. 별도
+`.cache/diagnostics/03_refinement_v2/`에 기록하고 본 학습 checkpoint를 만들지 않았다.
 
 ## 04 — Learned UPM이 실제 3DGS를 생성하는지 보기
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python 04_gaussian_avatar.py --stage train
+CUDA_VISIBLE_DEVICES=0 python 04_gaussian_avatar.py --stage train --val-every 100 --val-frames 1
 CUDA_VISIBLE_DEVICES=0 python 04_gaussian_avatar.py --stage render --identity-source refined
 ```
 
@@ -453,6 +619,57 @@ gaze, pose, camera만 바꾼다. 기본 portrait는 첫 frame이며 `--portrait-
 있다. `render.json`과 각 Gaussian tensor의 `reference_frame`/`driver_frame`으로 확인한다.
 여러 frame의 UV를 계속 바꿔 넣는 것을 single-portrait animation으로 간주하지 않는다.
 
+학습과 sequence rendering은 tqdm으로 진행률·속도·예상 시간을 표시한다. 학습 bar의
+`loss`는 현재 optimizer step의 학습 loss, `val_target`/`val_refined`는 가장 최근의 고정
+validation RGB L1이다. 각 loss 항·gradient norm·validation/checkpoint를 제외한 step
+시간은 `outputs/04/training.jsonl`에 기록하고 매 step debug 문장을 출력하지 않는다.
+Network 구조와 학습의 target UV 입력·loss 가중치는 유지한다.
+
+Validation은 시작 전, 기본 100 step마다, 마지막 step에 실행한다. 기본은 첫 held-out
+driving frame 1개이며 `--val-frames 0`이면 전체 held-out frame 평균을 평가한다.
+`outputs/04/validation/0.jpg`, `100.jpg`, `200.jpg`처럼 한 step당 JPEG 한 장을 저장한다.
+항상 같은 첫 frame을 표시하고, 사진은 letterbox로 종횡비를 보존한다.
+
+기본 조건은 `--val-sources target refined`다. 두 조건 모두 **train split의 한 portrait를
+고정**하고, held-out frame의 expression/neck/gaze/view와 camera만 바꾼다. Target은
+UPM 자체를 검사하는 oracle 입력이고, refined는 03 결과를 실제로 이어 넣는 조건이다.
+각 validation frame 자신의 보정 UV를 입력해 single-portrait 평가로 제시하지 않는다.
+`--portrait-frame`으로 validation portrait를 지정할 때는 train split의 frame이어야 한다.
+`refined` 파일이 없으면 이를 target으로 몰래 대체하지 않고, 필요한 경로를 알려준다.
+04만 독립적으로 먼저 학습하려면 `--val-sources target`을 지정한다.
+
+조건별 패널은 reference RGB, Gaussian RGB, 고정 scale의 RGB error, 고정 portrait의
+입력 texture, reference/Gaussian alpha, world normal, depth다. Depth 표시 범위는 같은
+driving frame의 tracked mesh에서 정하므로 예측마다 min/max를 다시 맞추지 않는다.
+이는 표시용 범위이며 GT geometry를 Gaussian 위치로 바꿔 넣는 과정이 아니다.
+
+`validation/metrics.jsonl`은 조건별 total/photo/mask/LPIPS/geometry/normal/Laplacian/offset,
+전체 흰 배경 합성 이미지 기준 PSNR과 Gaussian 수를 기록한다. Geometry target은 기존
+FLAME tracking의 local vertices이며 정확한 scan GT가 아니다. 하나의 identity에서 held-out
+frame을 평가하는 범위이며 새 identity 일반화 검증으로 해석하지 않는다. Validation은
+gradient/optimizer update 없이 실행하고 학습 RNG 및 train/eval 모드를 복원한다.
+
+고정 UV tensor는 학습 시작 때 한 번 읽고 hash와 portrait 경로를 기록한다. 따라서 실행
+중 03 export 파일이 바뀌어도 validation 입력은 바뀌지 않는다. Optimizer를 재개할 때는
+같은 frame/source/portrait/UV 파일을 요구한다. `--steps`는 추가 횟수가 아닌 총 목표다.
+새 validation 기능은 기존의 `latest.pt` checkpoint 저장 방식과 함께 동작한다.
+
+```bash
+# 03까지의 입력 없이 UPM 자체만 검증하는 독립 학습
+CUDA_VISIBLE_DEVICES=0 python 04_gaussian_avatar.py --stage train --val-sources target
+# 학습을 이어갈 때 validation 조건을 동일하게 지정한다.
+CUDA_VISIBLE_DEVICES=0 python 04_gaussian_avatar.py --stage train --resume --steps 60000
+# 저장된 latest weight로 validation만 다시 확인한다.
+CUDA_VISIBLE_DEVICES=0 python 04_gaussian_avatar.py --stage validate --val-frames 0
+```
+
+2026-10-20, GPU 0에서 작은 연결 smoke와 실제 UV512/약 22.4M UPM으로 검증했다.
+Full 설정은 frame당 235,498개 3D Gaussians를 사용하여 target/refined validation,
+held-out 7개 평가, optimizer의 2→3 step 재개 및 checkpoint 재로딩을 통과했다.
+기존 실행과 새 실행의 첫 학습 loss도 부동소수점 오차 범위에서 일치했다. 이는 표시와
+학습 연결을 확인한 짧은 검사이며 avatar 품질 수렴 검증은 아니다. 본 학습 자료와
+결과는 보존했고 검사 결과는 `.cache/diagnostics/04_validation_full/`에 격리했다.
+
 ## 학습 기록, checkpoint, smoke
 
 각 학습은 loss 항·gradient를 JSONL에 남긴다. Checkpoint는 model/optimizer/RNG/config,
@@ -467,9 +684,9 @@ CUDA_VISIBLE_DEVICES=0 python smoke.py
 
 Smoke는 `.cache/smoke/` 안에 격리한다. 실제 NeRSemble 출신 ELITE frame 0/32, 실제 FLAME,
 실제 Sapiens-1B/SDXL VAE/CLIP/LPIPS, 실제 mesh/3DGS CUDA backend를 사용한다.
-Sapiens 세 task는 각각 2 step, flow는 4 step, refiner/UPM은 각각 2 step 학습한다.
+Sapiens 세 task는 각각 2 step, flow는 4 step, refiner/UPM은 각각 2→3 step 재개를 확인한다.
 DiT/refiner/UPM의 smoke 크기와 이미지 해상도만 줄인다. 본 설정 생성 모델은 약 1.97B,
-refiner는 약 879M, UPM은 약 22.4M이다. 다음 명령은 축소하지 않은 모델의 실제
+refiner는 저해상도 attention 배치의 약 813M, UPM은 약 22.4M이다. 다음 명령은 축소하지 않은 모델의 실제
 forward/backward를 추가로 검사한다. Sapiens 입력은 1024×768, UV는 512다.
 
 ```bash

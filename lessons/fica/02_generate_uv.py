@@ -9,9 +9,12 @@ Pippo의 공식 DiTBlock과 ControlMLP를 revision 고정해 직접 사용한다
 CUDA_VISIBLE_DEVICES=0 python 02_generate_uv.py --stage cache --partial-source predicted
 CUDA_VISIBLE_DEVICES=0 python 02_generate_uv.py --stage train
 CUDA_VISIBLE_DEVICES=0 python 02_generate_uv.py --stage sample
+CUDA_VISIBLE_DEVICES=0 python 02_generate_uv.py --stage stabilize
+CUDA_VISIBLE_DEVICES=0 python 02_generate_uv.py --stage finetune-geometry
 """
 
 import importlib.util
+import json
 import math
 from pathlib import Path
 import sys
@@ -30,8 +33,11 @@ spec.loader.exec_module(L00)
 
 class FrozenConditioners(nn.Module):
     """VAE는 RGB처럼 보이는 XYZ의 수치 복원을 담당한다. 단위/normalization을 보존한다."""
-    def __init__(self, data, device, load_clip=True):
+    def __init__(self, data, device, load_clip=True, xyz_scale=1.):
         super().__init__()
+        if xyz_scale <= 0:
+            raise ValueError("XYZ codec scale은 양수여야 한다.")
+        self.xyz_scale = float(xyz_scale)
         from diffusers import AutoencoderKL
         self.vae = AutoencoderKL.from_pretrained(str(L00.asset_path("vae")), subfolder="vae", variant="fp16", torch_dtype=torch.float32).to(device).eval().requires_grad_(False)
         if load_clip:
@@ -43,7 +49,10 @@ class FrozenConditioners(nn.Module):
 
     def xyz_to_vae(self, xyz):
         # 색처럼 임의로 [0,1] clip하지 않는다. Normalized coordinates를 그대로 인코딩한다.
-        return (xyz - self.mean) / self.std
+        return (xyz - self.mean) / (self.std*self.xyz_scale)
+
+    def decode_xyz(self, latent):
+        return self.decode(latent)*self.std*self.xyz_scale + self.mean
 
     def encode(self, value):
         return self.vae.encode(value).latent_dist.mode() * self.scale
@@ -62,7 +71,7 @@ class FrozenConditioners(nn.Module):
         return self.clip(pixel_values=(crop - mean) / std).image_embeds
 
     @torch.no_grad()
-    def encode_sample(self, sample, identity, partial):
+    def encode_sample(self, sample, identity, partial, full_geometry=False):
         texture = identity["texture"][None]
         xyz = identity["xyz"][None]
         texture_latent = self.encode(texture * 2 - 1)
@@ -74,9 +83,14 @@ class FrozenConditioners(nn.Module):
         partial_latent = torch.cat([self.encode(value) for value in parts], 1)
         texture_weight = F.interpolate(identity["observed"][None].float(), size=texture_latent.shape[-2:], mode="area")
         geometry_weight = F.interpolate(identity["valid"][None, None].float(), size=xyz_latent.shape[-2:], mode="area")
+        if full_geometry:
+            # Atlas 밖은 미관측 표면이 아니라 알려진 padding이다. 이 latent를 noise로
+            # 방치하면 VAE의 넓은 receptive field를 통해 유효 XYZ까지 오염된다.
+            geometry_weight = torch.ones_like(geometry_weight)
         return {"texture": texture_latent[0].cpu(), "geometry": xyz_latent[0].cpu(),
                 "texture_weight": texture_weight[0].cpu(), "geometry_weight": geometry_weight[0].cpu(),
-                "control": partial_latent[0].cpu(), "clip": self.image_embedding(sample["rgb"][None])[0].cpu()}
+                "control": partial_latent[0].cpu(), "clip": self.image_embedding(sample["rgb"][None])[0].cpu(),
+                "geometry_codec": {"xyz_scale": self.xyz_scale, "full_geometry": full_geometry}}
 
 
 def pippo_modules():
@@ -157,7 +171,7 @@ class UVFlowModel(nn.Module):
         return F.pixel_shuffle(output, self.pack)
 
 
-def flow_loss(model, cache, noise=None, time=None):
+def flow_loss(model, cache, noise=None, time=None, geometry=None, return_terms=False):
     """Linear conditional flow: x_t=(1-t)epsilon+t*z, v*=z-epsilon.
 
     Texture/geometry 각각 forward한다. Sampling은 t=0 noise에서 t=1 data로 적분한다.
@@ -170,7 +184,72 @@ def flow_loss(model, cache, noise=None, time=None):
     weight = torch.stack((cache["texture_weight"], cache["geometry_weight"]))
     error = (result.float() - (target-noise).float()).square()
     # Complete texture GT가 없는 영역을 검정 정답으로 감독하지 않는다.
-    return (error * weight).sum() / (weight.sum().clamp_min(1e-6) * target.shape[1])
+    flow = (error * weight).sum() / (weight.sum().clamp_min(1e-6) * target.shape[1])
+    terms = {"flow": flow}
+    total = flow
+    if geometry is not None:
+        conditioners, identity, bridge, settings = geometry
+        # x_t + (1-t)*v는 정답 velocity일 때 정확히 x_1이다. 별도 학습 network가
+        # 아니라 같은 DiT 출력에 endpoint supervision을 더한다. VAE weight는 고정.
+        endpoint = (noisy[1:2] + (1-time[1])*result[1:2]).float()
+        with torch.autocast("cuda", enabled=False):
+            xyz = recompute(conditioners.decode_xyz, endpoint, use_reentrant=False)[0]
+            valid = identity["valid"][None]
+            xyz_loss = (((xyz-identity["xyz"])/conditioners.std[0]).abs()*valid).sum()/(valid.sum()*3)
+            vertices = bridge(xyz)
+            reference = identity["canonical_vertices"]
+            vertex_loss = ((vertices-reference)/conditioners.std.mean()).abs().mean()
+            edges = bridge.edges
+            delta = (vertices-reference)[edges[:, 0]]-(vertices-reference)[edges[:, 1]]
+            edge_loss = (delta/conditioners.std.mean()).abs().mean()
+            decoded = xyz_loss + settings["vertex_weight"]*vertex_loss + settings["edge_weight"]*edge_loss
+        total = total + settings["geometry_weight"]*decoded
+        terms.update(xyz=xyz_loss, vertex=vertex_loss, edge=edge_loss)
+    return (total, terms) if return_terms else total
+
+
+def run_paths(config, run_name=None):
+    if run_name is not None and (not run_name or Path(run_name).name != run_name or run_name in (".", "..")):
+        raise ValueError("run-name은 폴더 이름 하나로 지정하세요.")
+    root = L00.work_root(config)
+    suffix = Path(run_name) if run_name else Path()
+    return root/"outputs/02"/suffix, root/"checkpoints/02"/suffix/"latest.pt"
+
+
+def latent_path(data, row, run_name=None):
+    directory = data.path/"latents"
+    if run_name:
+        run_paths(data.manifest["config"], run_name)  # 경로 이름 검증
+        directory = directory/run_name
+    return directory/f"{Path(row['file']).stem}.pt"
+
+
+def codec_settings(config, run_name=None):
+    return {"xyz_scale": float(config["geometry_repair"]["xyz_scale"]) if run_name else 1.,
+            "full_geometry": bool(run_name)}
+
+
+def load_flow_model(path, data, device):
+    """구 checkpoint의 weight를 엄격히 읽는다. 평가/warm start는 코드 hash 변경 허용.
+
+    Optimizer resume는 별도의 L00.restore가 config/data/code/RNG까지 검사한다.
+    여기서는 dataset과 UV 해상도를 확인하고 checkpoint의 정확한 구조를 구성한다.
+    """
+    path = Path(path)
+    state = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    if state["format"] != "fica_checkpoint_v1" or state["data_sha256"] != L00.sha256(data.path/"manifest.json"):
+        raise ValueError("02 checkpoint format/dataset 불일치")
+    if state["config"]["uv_size"] != data.manifest["config"]["uv_size"]:
+        raise ValueError("02 checkpoint UV 해상도 불일치")
+    with torch.device("meta"):
+        model = UVFlowModel(state["config"])
+    model.load_state_dict(state["model"], strict=True, assign=True)
+    extra = state.get("extra", {})
+    metadata = {"checkpoint": str(path.resolve()), "source_step": state["step"],
+                "source_code_hashes": state["code_hashes"], "source_config": state["config"],
+                "geometry_codec": extra.get("geometry_codec", {"xyz_scale": 1., "full_geometry": False}),
+                "cache_run": extra.get("run"), "extra": extra}
+    return model.to(device), metadata
 
 
 @torch.no_grad()
@@ -191,9 +270,11 @@ def sample_domains(model, cache, steps, seed=42):
     return latent, history
 
 
-def build_cache(data, device, source="predicted"):
-    conditioners = FrozenConditioners(data, device)
-    for row in data.manifest["samples"]:
+def build_cache(data, device, source="predicted", run_name=None, config=None):
+    config = config or L00.read_config()
+    codec = codec_settings(config, run_name)
+    conditioners = FrozenConditioners(data, device, xyz_scale=codec["xyz_scale"])
+    for row in tqdm(data.manifest["samples"], desc="02 latent cache", dynamic_ncols=True, mininterval=1):
         sample = data.sample(row, device)
         identity = data.identity(row["identity"], device)
         stem = Path(row["file"]).stem
@@ -204,18 +285,24 @@ def build_cache(data, device, source="predicted"):
             partial = sample["partial_gt"]
         else:
             raise ValueError(source)
-        cache = conditioners.encode_sample(sample, identity, partial)
+        cache = conditioners.encode_sample(sample, identity, partial, full_geometry=codec["full_geometry"])
         cache.update(partial_source=source, identity=row["identity"], source=row["file"])
+        cache["data_sha256"] = L00.sha256(data.path/"manifest.json")
         if source == "predicted":
             cache["partial_sha256"] = L00.sha256(partial_path)
-        L00.save_tensor(data.path / "latents" / f"{stem}.pt", cache)
+        L00.save_tensor(latent_path(data, row, run_name), cache)
     del conditioners
     torch.cuda.empty_cache()
 
 
-def read_cache(data, row, device):
+def read_cache(data, row, device, run_name=None, codec=None):
     stem = Path(row["file"]).stem
-    cache = L00.load_tensor(data.path / "latents" / f"{stem}.pt", device)
+    cache = L00.load_tensor(latent_path(data, row, run_name), device)
+    actual_codec = cache.get("geometry_codec", {"xyz_scale": 1., "full_geometry": False})
+    if codec is not None and actual_codec != codec:
+        raise ValueError("XYZ codec가 다른 latent cache다. 해당 --run-name으로 02 --stage cache를 다시 실행하세요.")
+    if cache.get("data_sha256", L00.sha256(data.path/"manifest.json")) != L00.sha256(data.path/"manifest.json"):
+        raise ValueError("latent cache의 dataset 불일치")
     if cache["partial_source"] == "predicted":
         partial_path = data.path / "partial_pred" / f"{stem}.pt"
         if cache.get("partial_sha256") != L00.sha256(partial_path):
@@ -225,9 +312,58 @@ def read_cache(data, row, device):
 
 def decoded_result(conditioners, latent, identity):
     texture = (conditioners.decode(latent[:1]) + 1) / 2
-    xyz = conditioners.decode(latent[1:2]) * conditioners.std + conditioners.mean
+    xyz = conditioners.decode_xyz(latent[1:2])
     # Invalid UV는 topology 밖이다. geometry는 template/bary lookup과 함께 해석한다.
     return texture[0], xyz[0]
+
+
+def mesh_metrics(vertices, identity, bridge):
+    reference = identity["canonical_vertices"]
+    error = (vertices-reference).norm(dim=-1)
+    edges = bridge.edges
+    target_length = (reference[edges[:, 0]]-reference[edges[:, 1]]).norm(dim=-1).clamp_min(1e-8)
+    length = (vertices[edges[:, 0]]-vertices[edges[:, 1]]).norm(dim=-1)
+    return {"vertex_rmse": float(error.square().mean().sqrt()), "vertex_max": float(error.max()),
+            "stretched_edges_10x": int((length > 10*target_length).sum())}
+
+
+@torch.no_grad()
+def codec_check(config, data, device, run_name="geometry_repair"):
+    """DiT 학습 전에 raw XYZ -> VAE -> mesh 오차를 확인한다. 개인 정답은 평가에만 사용."""
+    codec = codec_settings(config, run_name)
+    conditioners = FrozenConditioners(data, device, load_clip=False)
+    out, _ = run_paths(config, run_name)
+    import nvdiffrast.torch as dr
+    context = dr.RasterizeCudaContext(device=device)
+    reports, images, titles = {}, [], []
+    for key in data.manifest["identities"]:
+        identity = data.identity(key, device)
+        bridge = data.bridge(key, device)
+        row = next(row for row in data.manifest["samples"] if row["identity"] == key)
+        sample = data.sample(row, device)
+        cases = {}
+        for name, scale in (("raw", None), ("legacy_vae", 1.), ("repaired_vae", codec["xyz_scale"])):
+            xyz = identity["xyz"]
+            if scale is not None:
+                conditioners.xyz_scale = scale
+                xyz = conditioners.decode_xyz(conditioners.encode(conditioners.xyz_to_vae(xyz[None])))[0]
+            vertices = bridge(xyz)
+            valid = identity["valid"]
+            values = mesh_metrics(vertices, identity, bridge)
+            values["xyz_rmse"] = float((xyz[:, valid]-identity["xyz"][:, valid]).square().sum(0).mean().sqrt())
+            cases[name] = values
+            if key == data.manifest["identities"][0]:
+                posed = L00.posed_from_canonical(vertices, sample)
+                image = L00.render_mesh(posed, bridge.faces, bridge.vt, bridge.ft, identity["texture"], sample["K"], sample["w2c"], *sample["rgb"].shape[-2:], context)["rgb"]
+                images.append(image); titles.append(f"{name}: scale={scale or '-'}")
+        diameter = float((identity["canonical_vertices"].amax(0)-identity["canonical_vertices"].amin(0)).norm())
+        cases["relative_vertex_rmse"] = cases["repaired_vae"]["vertex_rmse"]/diameter
+        reports[key] = cases
+    L00.save_json(out/"codec_check.json", {"geometry_codec": codec, "mesh_laplacian": bridge.laplacian, "identities": reports})
+    L00.save_panels(out/"codec_check.jpg", images, titles)
+    if config.get("profile") != "smoke" and any(value["relative_vertex_rmse"] > .05 for value in reports.values()):
+        raise ValueError(f"XYZ codec 왕복 오차가 head 크기의 5%를 넘는다. {out/'codec_check.json'}을 먼저 확인하세요.")
+    return reports
 
 
 def validation_rows(data, limit):
@@ -240,13 +376,16 @@ def validation_rows(data, limit):
 
 def save_validation_panel(path, images, titles, step, row, metrics, seed, sample_steps, frame_count):
     """한 step을 JPEG 한 장에 저장한다. 사진의 종횡비와 error 색 범위를 유지한다."""
-    side, header, label_height, columns = 300, 78, 28, 3
+    side, header, label_height, columns = 300, 96, 28, 3
     rows = math.ceil(len(images) / columns)
     canvas = Image.new("RGB", (columns*side, header+rows*(side+label_height)), (24, 24, 24))
     draw = ImageDraw.Draw(canvas)
     draw.text((10, 8), f"02 | optimizer step {step} | held-out {Path(row['file']).stem}", fill="white")
     draw.text((10, 27), f"Fixed seed={seed} | Euler steps={sample_steps} | flow loss at t=0.5 | {frame_count} validation frame(s)", fill="white")
-    draw.text((10, 46), "Mean validation: " + " | ".join(f"{key}={value:.5g}" for key, value in metrics.items()), fill="white")
+    displayed = {key:value for key,value in metrics.items() if key not in ("vertex_max","stretched_edges_10x")}
+    draw.text((10, 46), "Mean validation: " + " | ".join(f"{key}={value:.5g}" for key, value in displayed.items()), fill="white")
+    if "stretched_edges_10x" in metrics:
+        draw.text((10, 66), f"Mesh: max vertex error={metrics['vertex_max']:.5g} | edges stretched >10x={metrics['stretched_edges_10x']:.0f}", fill="white")
     for index, (value, title) in enumerate(zip(images, titles)):
         value = value.detach().float().cpu().expand(3, -1, -1)
         array = (value.clamp(0, 1).permute(1, 2, 0).numpy()*255).round().astype("uint8")
@@ -261,7 +400,7 @@ def save_validation_panel(path, images, titles, step, row, metrics, seed, sample
 
 
 @torch.no_grad()
-def validate(config, data, model, device, conditioners, context, rows, out, step, sample_steps):
+def validate(config, data, model, device, conditioners, context, rows, out, step, sample_steps, run_name=None):
     """고정 noise/time으로 loss와 생성 결과를 평가한다. 학습 RNG/모드는 복원한다.
 
     Loss는 t=0.5의 flow velocity 오차다. Texture/XYZ 지표는 noise에서 시작해
@@ -275,7 +414,7 @@ def validate(config, data, model, device, conditioners, context, rows, out, step
     try:
         with torch.random.fork_rng(devices=[device]):
             for index, row in enumerate(rows):
-                cache = read_cache(data, row, device)
+                cache = read_cache(data, row, device, run_name, codec_settings(config, run_name))
                 identity = data.identity(row["identity"], device)
                 seed = config["seed"] + index
                 generator = torch.Generator(device=device).manual_seed(seed)
@@ -295,6 +434,8 @@ def validate(config, data, model, device, conditioners, context, rows, out, step
                 values = {"flow_loss": float(loss),
                           "texture_l1": float((texture_error*observed).sum()/observed.sum()),
                           "xyz_rmse": float(((xyz_error.square()*valid).sum()/valid.sum()).sqrt())}
+                bridge = data.bridge(row["identity"], device)
+                values.update(mesh_metrics(bridge(xyz), identity, bridge))
                 for key, value in values.items():
                     totals[key] = totals.get(key, 0.) + value
                 if preview is None:
@@ -329,6 +470,7 @@ def validate(config, data, model, device, conditioners, context, rows, out, step
         L00.append_log(directory/"metrics.jsonl", {"step": step, **metrics, "frames": [row["file"] for row in rows],
             "preview_frame": preview[2]["file"], "seed": config["seed"], "sample_steps": sample_steps,
             "flow_time": .5, "partial_source": cache["partial_source"], "scope": data.manifest["scope"],
+            "geometry_codec": codec_settings(config, run_name), "mesh_laplacian": bridge.laplacian,
             "texture_metric": "unclamped RGB L1 over train-observed target texels",
             "xyz_metric": "Euclidean RMSE in world units over valid UV texels"})
         return metrics
@@ -336,96 +478,177 @@ def validate(config, data, model, device, conditioners, context, rows, out, step
         model.train(was_training)
 
 
-def train(config, data, device, steps, resume=False, val_every=100, val_frames=1, val_sample_steps=None):
+def train(config, data, device, steps, resume=False, val_every=100, val_frames=1, val_sample_steps=None,
+          run_name=None, init_from=None, repair=False):
     if steps < 1 or val_every < 1 or val_frames < 0 or (val_sample_steps is not None and val_sample_steps < 1):
         raise ValueError("steps/val_every/val_sample_steps >= 1, val_frames >= 0 이어야 한다.")
     rows = validation_rows(data, val_frames)
     sample_steps = config["diffusion"]["sample_steps"] if val_sample_steps is None else val_sample_steps
-    out = L00.work_root(config)/"outputs/02"
-    model = UVFlowModel(config).to(device).train()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config["diffusion"]["lr"], weight_decay=config["diffusion"]["weight_decay"])
-    start=L00.training_start(L00.work_root(config)/"checkpoints/02/latest.pt",model,optimizer,config,data,resume)
+    out, path = run_paths(config, run_name)
+    codec = codec_settings(config, run_name)
+    if repair and not run_name:
+        raise ValueError("geometry 추가 학습은 별도 run-name이 필요하다.")
+    if path.exists() and not resume and config.get("profile") != "smoke":
+        raise FileExistsError(f"{path}가 있다. --resume 또는 새 --run-name을 사용하세요.")
+    for row in data.manifest["samples"]:
+        read_cache(data, row, "cpu", run_name, codec)
+    parent = None
+    if init_from is not None:
+        if resume or Path(init_from).resolve() == path.resolve():
+            raise ValueError("init-from은 새 run의 weight 초기화 전용이다.")
+        model, parent = load_flow_model(init_from, data, device)
+        for key in ("width", "depth", "heads", "patch_size", "latent_pack", "clip_dim"):
+            if parent["source_config"]["diffusion"][key] != config["diffusion"][key]:
+                raise ValueError(f"warm start Network 구조 불일치: {key}")
+        model.checkpoint_blocks = config["diffusion"]["checkpoint_blocks"]
+    else:
+        model = UVFlowModel(config).to(device)
+    model.train()
+    settings = config["geometry_repair"]
+    optimizer = torch.optim.AdamW(model.parameters(), lr=settings["lr"] if repair else config["diffusion"]["lr"], weight_decay=config["diffusion"]["weight_decay"])
+    start=L00.training_start(path,model,optimizer,config,data,resume)
+    if resume:
+        state = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+        if state["extra"].get("geometry_codec", {"xyz_scale":1.,"full_geometry":False}) != codec:
+            raise ValueError("resume checkpoint/cache의 XYZ codec 불일치")
+        parent = state["extra"].get("parent")
+        del state
+    if start > steps:
+        raise ValueError("목표 steps가 이미 학습한 step보다 작다.")
     # CLIP/partial은 이미 cache에 있으므로 validation에는 VAE만 한 번 로드한다.
     # 이 초기화와 validation이 학습의 noise/frame 추출 순서를 바꾸지 않도록 한다.
     with torch.random.fork_rng(devices=[device]):
         import nvdiffrast.torch as dr
         context = dr.RasterizeCudaContext(device=device)
-        conditioners = FrozenConditioners(data, device, load_clip=False)
+        conditioners = FrozenConditioners(data, device, load_clip=False, xyz_scale=codec["xyz_scale"])
     accumulation=config["training"]["grad_accumulation"]
     with tqdm(total=steps, initial=start, desc="02 UV generation", unit="step", dynamic_ncols=True, mininterval=1) as bar:
-        recent = validate(config, data, model, device, conditioners, context, rows, out, start, sample_steps)
+        recent = validate(config, data, model, device, conditioners, context, rows, out, start, sample_steps, run_name)
         bar.set_postfix(val=f"{recent['flow_loss']:.5f}", refresh=False)
         for step in range(start,steps):
             optimizer.zero_grad(set_to_none=True)
-            mean_loss=0.
+            mean_loss=0.; mean_terms={}
             for micro in range(accumulation):
-                cache=read_cache(data,data.training_row(),device)
+                row = data.training_row()
+                cache=read_cache(data,row,device,run_name,codec)
+                geometry = None
+                if repair and step >= settings["warmup_steps"] and (step-settings["warmup_steps"]) % settings["geometry_every"] == 0:
+                    geometry = (conditioners, data.identity(row["identity"],device), data.bridge(row["identity"],device), settings)
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    loss = flow_loss(model, cache)
+                    loss, terms = flow_loss(model, cache, geometry=geometry, return_terms=True)
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"02 training loss NaN/Inf at step {step+1}")
                 (loss/accumulation).backward()
                 mean_loss+=float(loss.detach())/accumulation
+                for key, value in terms.items():
+                    mean_terms[key] = mean_terms.get(key,0.)+float(value.detach())/accumulation
             report = L00.gradients(model)
             torch.nn.utils.clip_grad_norm_(model.parameters(), config["training"]["clip_grad"])
             optimizer.step()
-            L00.append_log(out/"training.jsonl", {"step": step+1, "loss": mean_loss, "gradient": report, "partial_source": cache["partial_source"]})
+            L00.append_log(out/"training.jsonl", {"step": step+1, "loss": mean_loss, "terms": mean_terms,
+                "gradient": report, "partial_source": cache["partial_source"], "geometry_codec": codec})
             if (step+1) % val_every == 0 or step == steps-1:
-                recent = validate(config, data, model, device, conditioners, context, rows, out, step+1, sample_steps)
+                recent = validate(config, data, model, device, conditioners, context, rows, out, step+1, sample_steps, run_name)
             bar.set_postfix(loss=f"{mean_loss:.5f}", val=f"{recent['flow_loss']:.5f}", refresh=False)
             bar.update(1)
-            if (step+1) % config["training"]["checkpoint_every"] == 0 or step == steps-1:
-                L00.checkpoint(L00.work_root(config) / "checkpoints/02/latest.pt", model, optimizer, config, data, step+1)
+            checkpoint_every = settings["checkpoint_every"] if repair else config["training"]["checkpoint_every"]
+            if (step+1) % checkpoint_every == 0 or step == steps-1:
+                L00.checkpoint(path, model, optimizer, config, data, step+1,
+                    extra={"run":run_name,"geometry_codec":codec,"parent":parent,"geometry_supervision":repair})
     del conditioners, context
     return model.eval()
 
 
 @torch.no_grad()
-def generate(config, data, model, device, steps=None):
+def generate(config, data, model, device, steps=None, run_name=None, cache_run=None,
+             codec=None, output_name="generated", source=None):
     import nvdiffrast.torch as dr
     context=dr.RasterizeCudaContext(device=device)
-    conditioners = FrozenConditioners(data, device)
-    for row in data.manifest["samples"]:
-        cache = read_cache(data, row, device)
+    codec = codec or {"xyz_scale":1.,"full_geometry":False}
+    conditioners = FrozenConditioners(data, device, load_clip=False, xyz_scale=codec["xyz_scale"])
+    out, _ = run_paths(config, run_name)
+    reports = []
+    for row in tqdm(data.manifest["samples"], desc="02 UV sampling", dynamic_ncols=True, mininterval=1):
+        cache = read_cache(data, row, device, cache_run, codec)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             latent, history = sample_domains(model, cache, steps or config["diffusion"]["sample_steps"])
         texture, xyz = decoded_result(conditioners, latent.float(), data.identity(row["identity"], device))
         stem = Path(row["file"]).stem
-        L00.save_tensor(data.path / "generated" / f"{stem}.pt", {"texture": texture.cpu(), "xyz": xyz.cpu(), "history": history,
-             "source": row["file"], "partial_source": cache["partial_source"], "model": "UVFlowModel"})
+        if not torch.isfinite(texture).all() or not torch.isfinite(xyz).all():
+            raise FloatingPointError(f"02 generation NaN/Inf: {stem}")
         identity = data.identity(row["identity"], device)
         bridge=data.bridge(row["identity"],device)
         sample=data.sample(row,device)
-        vertices=L00.posed_from_canonical(bridge(xyz),sample)
+        canonical_vertices = bridge(xyz)
+        values = mesh_metrics(canonical_vertices, identity, bridge)
+        values.update(frame=row["file"],split=row["split"])
+        reports.append(values)
+        L00.save_tensor(data.path / output_name / f"{stem}.pt", {"texture": texture.cpu(), "xyz": xyz.cpu(), "history": history,
+             "xyz_surface":bridge.vertices_to_uv(canonical_vertices).cpu(), "source": row["file"],
+             "partial_source": cache["partial_source"], "model": "UVFlowModel", "geometry_codec":codec,
+             "mesh_bridge":{"ridge":bridge.ridge,"laplacian":bridge.laplacian}, "predictor":source or {},
+             "gt_used_for_prediction":False})
+        vertices=L00.posed_from_canonical(canonical_vertices,sample)
         rendered=L00.render_mesh(vertices,bridge.faces,bridge.vt,bridge.ft,texture,sample["K"],sample["w2c"],*sample["rgb"].shape[-2:],context)
-        L00.save_panels(L00.work_root(config) / "outputs/02" / f"{stem}.jpg", [sample["rgb"],rendered["rgb"], texture, (xyz-conditioners.mean[0])/(conditioners.std[0]*6)+.5],
+        L00.save_panels(out/"predictions"/f"{stem}.jpg", [sample["rgb"],rendered["rgb"], texture, (xyz-conditioners.mean[0])/(conditioners.std[0]*6)+.5],
                         ["Reference", "Generated mesh render", "Generated texture", "Generated XYZ (display)"])
+    L00.save_json(out/"generation_metrics.json", {"geometry_codec":codec,"mesh_laplacian":bridge.laplacian,
+                 "metrics_use_gt_for_evaluation_only":True,"frames":reports})
     del conditioners
     torch.cuda.empty_cache()
 
 
 def main():
     parser = L00.arguments(__doc__)
-    parser.add_argument("--stage", choices=("cache", "train", "sample"), default="cache")
+    parser.add_argument("--stage", choices=("cache", "train", "sample", "stabilize", "codec-check", "finetune-geometry"), default="cache")
     parser.add_argument("--partial-source", choices=("predicted", "gt_correspondence"), default="predicted")
     parser.add_argument("--val-every", type=int, default=100, help="Validation 간격 (optimizer step, 기본 100)")
     parser.add_argument("--val-frames", type=int, default=1, help="고정 held-out frame 수; 0은 전체 (기본 1)")
     parser.add_argument("--val-sample-steps", type=int, help="Validation Euler step 수 (기본 config의 sample_steps=50)")
+    parser.add_argument("--run-name", help="추가 학습/cache의 폴더 이름. finetune-geometry 기본 geometry_repair")
+    parser.add_argument("--init-from", type=Path, help="추가 학습의 weight 초기화. 기본 기존 checkpoints/02/latest.pt")
+    parser.add_argument("--checkpoint", type=Path, help="sample/stabilize에서 읽을 checkpoint")
     args = parser.parse_args()
     if args.val_every < 1 or args.val_frames < 0 or (args.val_sample_steps is not None and args.val_sample_steps < 1):
         parser.error("--val-every/--val-sample-steps >= 1, --val-frames >= 0 이어야 한다.")
+    if args.init_from and (args.stage not in ("train","finetune-geometry") or args.resume):
+        parser.error("--init-from은 새 train/finetune-geometry 전용이다. --resume과 함께 쓰지 않는다.")
+    if args.checkpoint and args.stage not in ("sample","stabilize"):
+        parser.error("--checkpoint는 sample/stabilize 전용이다.")
+    if args.resume and args.stage not in ("train","finetune-geometry"):
+        parser.error("--resume은 train/finetune-geometry 전용이다.")
     config = L00.read_config(args.config, args.smoke)
     device = L00.setup_device(args.device, config["seed"])
     data = L00.PreparedData(args.data)
+    run_name = args.run_name or ("geometry_repair" if args.stage in ("finetune-geometry","codec-check") else None)
+    run_paths(config, run_name)
     if args.stage == "cache":
-        build_cache(data, device, args.partial_source)
-    elif args.stage == "train":
-        train(config, data, device, args.steps or config["training"]["steps"], resume=args.resume,
-              val_every=args.val_every, val_frames=args.val_frames, val_sample_steps=args.val_sample_steps)
+        build_cache(data, device, args.partial_source, run_name, config)
+    elif args.stage == "codec-check":
+        codec_check(config,data,device,run_name)
+    elif args.stage in ("train","finetune-geometry"):
+        repair = args.stage == "finetune-geometry"
+        if repair:
+            codec_check(config,data,device,run_name)
+            torch.cuda.empty_cache()
+            if any(not latent_path(data,row,run_name).exists() for row in data.manifest["samples"]):
+                build_cache(data,device,args.partial_source,run_name,config)
+        init_from = args.init_from or (run_paths(config)[1] if repair and not args.resume else None)
+        model = train(config, data, device, args.steps or (config["geometry_repair"]["steps"] if repair else config["training"]["steps"]),
+              resume=args.resume, val_every=args.val_every, val_frames=args.val_frames, val_sample_steps=args.val_sample_steps,
+              run_name=run_name,init_from=init_from,repair=repair)
+        if repair:
+            # 완료된 새 모델의 raw world XYZ를 03/04가 그대로 읽을 수 있게 내보낸다.
+            generate(config,data,model,device,run_name=run_name,cache_run=run_name,codec=codec_settings(config,run_name),
+                     source={"checkpoint":str(run_paths(config,run_name)[1]),"run":run_name})
     else:
-        model = UVFlowModel(config).to(device).eval()
-        L00.restore(L00.work_root(config) / "checkpoints/02/latest.pt", model, config, data)
-        generate(config, data, model, device, args.steps)
+        path = args.checkpoint or run_paths(config,None if args.stage=="stabilize" else run_name)[1]
+        model, source = load_flow_model(path,data,device)
+        model.eval()
+        stable = args.stage == "stabilize"
+        generate(config,data,model,device,args.steps,run_name="stabilized" if stable else run_name,
+                 cache_run=source["cache_run"],codec=source["geometry_codec"],
+                 output_name="generated_stabilized" if stable else "generated",source=source)
 
 
 if __name__ == "__main__":

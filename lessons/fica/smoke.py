@@ -243,11 +243,39 @@ def stage_generation(config,data,device):
         restored=clone(latent,t,cache["clip"][None],cache["control"][None],torch.tensor([0],device=device))
         assert torch.allclose(full,restored,atol=1e-6)
     module.generate(config,data,model,device,steps=4)
+    parent=L00.work_root(config)/"checkpoints/02/latest.pt"
+    repaired_run="geometry_repair_smoke"
+    module.build_cache(data,device,"predicted",repaired_run,config)
+    repaired_cache=module.read_cache(data,data.samples("train")[0],device,repaired_run,module.codec_settings(config,repaired_run))
+    assert repaired_cache["geometry_weight"].eq(1).all() and repaired_cache["geometry_codec"]["xyz_scale"]==3.
+    try:
+        module.read_cache(data,data.samples("train")[0],device,repaired_run,{"xyz_scale":1.,"full_geometry":False})
+    except ValueError:
+        codec_mismatch_rejected=True
+    else:
+        raise AssertionError("잘못된 XYZ codec cache를 허용했다.")
+    repaired=module.train(config,data,device,2,run_name=repaired_run,init_from=parent,repair=True,val_every=1,val_sample_steps=2)
+    repair_out,repair_path=module.run_paths(config,repaired_run)
+    log=[json.loads(line) for line in (repair_out/"training.jsonl").read_text().splitlines()][-2:]
+    assert all(set(("flow","xyz","vertex","edge")).issubset(item["terms"]) for item in log)
+    assert log[-1]["gradient"]["absolute_sum"]>0
+    repaired=module.train(config,data,device,3,run_name=repaired_run,resume=True,repair=True,val_every=1,val_sample_steps=2)
+    saved=torch.load(repair_path,map_location="cpu",weights_only=True,mmap=True)
+    assert saved["step"]==3 and saved["extra"]["parent"]["source_step"]==4
+    assert saved["extra"]["geometry_codec"]["xyz_scale"]==3.
+    module.generate(config,data,repaired,device,steps=2,run_name=repaired_run,cache_run=repaired_run,
+                    codec=module.codec_settings(config,repaired_run))
+    packet=L00.load_tensor(data.path/"generated"/f"{Path(data.samples('train')[0]['file']).stem}.pt")
+    assert packet["geometry_codec"]["xyz_scale"]==3. and packet["mesh_bridge"]["laplacian"]==10.
+    finite(packet["xyz"])
+    del saved,repaired,repaired_cache
     result={"train_steps":4,"sample_steps":4,"actual_external_weights":["SDXL VAE","CLIP ViT-L/14"],
             "control_effect_max":control_effect,"checkpoint_roundtrip":True,"predicted_partial_used":True,
             "parameters":sum(p.numel() for p in model.parameters()),"profile":"small DiT; full paper depth stays in fica_config.json",
             "validation_steps":[0,2,4],"fixed_heldout_frame_and_seed":True,
-            "validation_rng_and_mode_preserved":True,"validation_deterministic":True}
+            "validation_rng_and_mode_preserved":True,"validation_deterministic":True,
+            "geometry_codec_mismatch_rejected":codec_mismatch_rejected,"geometry_decoded_losses_backpropagate":True,
+            "geometry_warm_start_parent_step":4,"geometry_optimizer_resume_step":3}
     del model,clone
     clear()
     return result
@@ -257,7 +285,40 @@ def stage_refinement(config,data,device):
     module=L00.lesson(3)
     module.cache_features(data,device)
     clear()
-    model=module.train(config,data,device,2)
+    row=data.samples("train")[0]
+    initial=module.read_initial(data,row,device)
+    bridge=data.bridge(row["identity"],device)
+    # 실제 mesh vertex의 중심을 고정한다. UV 평균이나 개인 GT geometry를 쓰지 않는다.
+    shift=torch.tensor([.03,-.02,.01],device=device)[None,:,None,None]
+    translated=initial["xyz"][None]+shift*bridge.valid[None,None]
+    centered=module.constrain_geometry(translated,initial["xyz"],bridge)
+    assert (centered[0]-initial["xyz"]).abs().max()<1e-6
+    noise=(torch.randn_like(translated)*.001).requires_grad_(True)
+    centered=module.constrain_geometry(initial["xyz"][None]+noise,initial["xyz"],bridge)
+    drift=(bridge(centered[0])-bridge(initial["xyz"])).mean(0).norm()
+    assert float(drift)<1e-6
+    centered.square().mean().backward()
+    assert noise.grad is not None and noise.grad.abs().sum()>0
+    model=module.train(config,data,device,2,val_every=1)
+    out=L00.work_root(config)/"outputs/03"
+    records=[json.loads(line) for line in (out/"validation/metrics.jsonl").read_text().splitlines()][-3:]
+    heldout=data.samples("validation")[0]["file"]
+    assert [item["step"] for item in records]==[0,1,2]
+    assert all(item["frames"]==[heldout] for item in records)
+    assert all((out/"validation"/f"{step}.jpg").is_file() for step in (0,1,2))
+    # Validation이 다음 학습 frame/noise 선택이나 train/eval 모드를 바꾸지 않는다.
+    import nvdiffrast.torch as dr
+    import random
+    model.train()
+    cpu_rng,cuda_rng,python_rng=torch.get_rng_state(),torch.cuda.get_rng_state(device),random.getstate()
+    repeated=module.validate(config,data,model,device,dr.RasterizeCudaContext(device=device),
+                             module.validation_rows(data,1),out,2)
+    assert model.training and torch.equal(cpu_rng,torch.get_rng_state())
+    assert torch.equal(cuda_rng,torch.cuda.get_rng_state(device)) and python_rng==random.getstate()
+    assert abs(repeated["photo"]-records[-1]["photo"])<1e-7
+    del model
+    clear()
+    model=module.train(config,data,device,3,resume=True,val_every=1)
     module.predict(config,data,model,device)
     row=data.samples("train")[0]
     initial=module.read_initial(data,row,device)
@@ -267,8 +328,15 @@ def stage_refinement(config,data,device):
     assert change>0
     clone=module.RefinementNet(config).to(device)
     L00.restore(L00.work_root(config)/"checkpoints/03/latest.pt",clone,config,data)
-    result={"train_steps":2,"module":"actual Diffusers UNet2DConditionModel","conditioner":"actual frozen Sapiens-1B",
-            "mean_texture_change":change,"checkpoint_reload":True,"renderer":"nvdiffrast CUDA; original FLAME topology"}
+    best,info=module.load_refiner(L00.work_root(config)/"checkpoints/03/best.pt",data,device)
+    assert info["step"] in (0,1,2,3)
+    del best
+    result={"train_steps":3,"module":"actual Diffusers UNet2DConditionModel","conditioner":"actual frozen Sapiens-1B",
+            "mean_texture_change":change,"checkpoint_reload":True,"optimizer_resume":"2 -> 3",
+            "fixed_heldout_validation":heldout,"validation_steps":[0,1,2,3],"validation_preserves_rng_and_mode":True,
+            "attention_resolutions":model.attention_resolutions,"mesh_centroid_drift":float(drift),
+            "geometry_constraint_gradient":True,"best_weight_only_reload":True,
+            "renderer":"nvdiffrast CUDA; original FLAME topology"}
     del model,clone
     clear()
     return result
@@ -276,7 +344,28 @@ def stage_refinement(config,data,device):
 
 def stage_avatar(config,data,device):
     module=L00.lesson(4)
-    model=module.train(config,data,device,2,perceptual=True)
+    model=module.train(config,data,device,2,perceptual=True,val_every=1)
+    out=L00.work_root(config)/"outputs/04"
+    records=[json.loads(line) for line in (out/"validation/metrics.jsonl").read_text().splitlines()][-3:]
+    heldout=data.samples("validation")[0]["file"]
+    portrait=data.samples("train")[0]["file"]
+    assert [item["step"] for item in records]==[0,1,2]
+    assert all(item["frames"]==[heldout] for item in records)
+    assert all(set(item["metrics"])=={"target","refined"} for item in records)
+    assert all((out/"validation"/f"{step}.jpg").is_file() for step in (0,1,2))
+    assert all(entry["portrait"]==portrait for group in records[-1]["fixed_identity_inputs"].values() for entry in group.values())
+    import random
+    rows,inputs=module.validation_setup(data,device)
+    model.train()
+    cpu_rng,cuda_rng,python_rng=torch.get_rng_state(),torch.cuda.get_rng_state(device),random.getstate()
+    repeated=module.validate(config,data,model,device,rows,inputs,out,2)
+    assert model.training and torch.equal(cpu_rng,torch.get_rng_state())
+    assert torch.equal(cuda_rng,torch.cuda.get_rng_state(device)) and python_rng==random.getstate()
+    for source in repeated:
+        assert abs(repeated[source]["photo"]-records[-1]["metrics"][source]["photo"])<1e-6
+    del model,inputs
+    clear()
+    model=module.train(config,data,device,3,perceptual=True,resume=True,val_every=1)
     module.render_sequence(config,data,model,device,"refined")
     first_packet=L00.load_tensor(L00.work_root(config)/"outputs/04/refined/000000.pt")
     second_packet=L00.load_tensor(L00.work_root(config)/"outputs/04/refined/000001.pt")
@@ -303,11 +392,14 @@ def stage_avatar(config,data,device):
         assert rendered["alpha"].max()>.01
         clone=module.UniversalPrior(config).to(device)
         L00.restore(L00.work_root(config)/"checkpoints/04/latest.pt",clone,config,data)
-    result={"train_steps":2,"renderer":"Graphdeco differentiable 3DGS CUDA","scale_channels":3,
+    result={"train_steps":3,"renderer":"Graphdeco differentiable 3DGS CUDA","scale_channels":3,
             "gaussians":len(gs["position"]),"id_bias_shapes":[list(x.shape) for x in bias["geometry"]],
             "expression_geometry_effect_max":changed,"checkpoint_reload":True,"lpips":True,
             "geometry_anchor":"learned guide; GT posed mesh is supervision only", "end_to_end_refined_uv_to_3dgs":True,
-            "fixed_single_portrait_for_animation":True}
+            "fixed_single_portrait_for_animation":True,"optimizer_resume":"2 -> 3",
+            "fixed_heldout_validation":heldout,"fixed_train_portrait":portrait,
+            "validation_sources":["target","refined"],"validation_steps":[0,1,2,3],
+            "validation_preserves_rng_and_mode":True}
     del model,clone,bridge
     clear()
     return result
@@ -367,8 +459,7 @@ def stage_full(config,data,device):
     del encoder
     clear()
     refiner=L00.lesson(3).RefinementNet(full).to(device).train()
-    with torch.autocast("cuda",dtype=torch.bfloat16):
-        texture,xyz=refiner(initial["texture"][None],initial["xyz"][None],reference,features,mean,std)
+    texture,xyz=L00.lesson(3).refine(full,refiner,initial,{"reference":reference,"rendered":features},mean,std,bridge)
     loss,terms,_=L00.lesson(3).refinement_loss(full,texture.float(),xyz.float(),initial,identity,sample,bridge,context)
     loss.backward()
     results["refinement"]={"parameters":sum(p.numel() for p in refiner.parameters()),"loss":float(loss.detach()),"gradient":L00.gradients(refiner)}
