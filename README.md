@@ -28,7 +28,7 @@
 </details>
 
 <details>
-<summary>FiCA (26/10/17 ~ )</summary>
+<summary>FiCA (26/10/17 ~ 10/21)</summary>
 <div markdown="1">
 
 - 기존 FLAME을 사용한다면 Partial uv map 예측은 필요 없어진다. 아마 FiCA의 dataset자체가 내부 multi-view iphone 촬영 데이터셋이기도 하고 그중에서도 single image로만 이용하기 때문에 기존에 Sapiens가 Foundation model로서 학습하던 것을 이용하여 partial uv map을 예측하게 fine-tune하게 된다.
@@ -36,9 +36,9 @@
 - 2자체는 Partial UV Map을 이용하여 Canonical UV Map을 생성하는 부분이다. 이렇게 되면 안보이는 부분에 대한 texture를 일관성있게 생성해 낼 수 있기 때문에 이러한 부분이 2D UV Map에서의 장점이 되는 것 같다.
   - [X] Prepare dataset (NeRSemble)
   - [X] Extract partial uv map
-  - [] UV Texture / Geometry Diffusion
-  - [] UV Refine Network
-  - [] Gaussian Avatar Training
+  - [X] UV Texture / Geometry Diffusion
+  - [X] UV Refine Network
+  - [X] Gaussian Avatar Training
 - [FiCA (arXiv 2026)](https://arxiv.org/pdf/2606.24232)
 
 </div>
