@@ -45,7 +45,7 @@
 </details>
 
 <details>
-<summary>Video Diffusion Avatars(VDA) (26/11/13 ~ )</summary>
+<summary>Video Diffusion Avatars(VDA) (26/11/13 ~ 11/13)</summary>
 <div markdown="1">
 
   - 해당 논문은 기본적으로 지금까지 관심있게 봐왔던 Gaussian Avatar 방법론들과 다르게 Diffusion based Video 형식으로 출력하는 연구이다. explicit한 representation(point-cloud, gs, mesh...)으로 내놓지 않기 때문에 조금은 다른 결이라고 볼 수도 있을 것 같다.
@@ -53,12 +53,34 @@
   - 해당 논문의 Contribution & Novelty는 VDM에서 강력한 multi-view consistency를 확보하면서도 입력으로 들어오는 Single Reference에 대해서 일관성을 유지하며 Video Model안에서도 expression, camera view를 분리하여 Avatar를 표현한다는 것이다.
   - 하지만 실제로 [WAN-Animate-2](https://humanaigc.github.io/wan-animate-2/)를 보자면 똑같이 Single Reference에 대해 입력으로 들어오는 drive video에 대응하는 결과 video를 그대로 출력하는 것을 볼 수 있다. 심지어 Novel-view에 대한 multi-view consistency도 지켜주는 것을 볼 수 있고 더불어 배경또한 일관성있게 잘 처리하는 것을 볼 수 있다. 만약 실제 conference review라면 이렇게 지적할 수 있을까? "WAN-Animate-2에서도 이미 잘되고 있으면서 같은 기능을 똑같이 잘 수행하는 연구가 있는데 이 연구의 독창적인 차별점이 보이지 않는다." 그냥 단순하게 생각하면 이렇게 치부할 수 있을 것이라 생각되기도 한다. 
 
-  - [] Data and proxy model preparation
-  - [] Expression disentanglement
-  - [] Connect wan
-  - [] Train full-pipeline avatar
-  - [] Generate 
+  - [X] Data and proxy model preparation
+  - [X] Expression disentanglement
+  - [X] Connect wan
+  - [X] Train full-pipeline avatar
+  - [X] Generate 
 - [Video Diffusion Avatars (arXiv 2026)](https://simongiebenhain.github.io/video-diffusion-avatars/)
+
+</div>
+</details>
+
+<details>
+<summary>Diffusion Transformer(DiT) (26/11/13 ~ )</summary>
+<div markdown="1">
+  - 
+
+  - [] study frozen VAE, pixels and latents
+  - [] Forward diffusion
+  - [] Patch embedding and token
+  - [] Attention and conditions
+  - [] AdaLN-Zero
+  - [] Optimize objective loss
+  - [] Optimize train
+  - [] Reverse diffusion
+  - [] CFG
+  - [] Scaling
+  - [] Original pretrained XL/2 inference
+
+- [Scalable Diffusion Models with Transformers (ICCV 2023 Oral)](https://www.wpeebles.com/DiT)
 
 </div>
 </details>
