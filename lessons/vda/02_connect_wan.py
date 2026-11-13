@@ -1,4 +1,31 @@
-"""02 — 공개 WAN-Animate 모듈 연결, trainable boundary, frozen encoder cache.
+r"""02 — 공개 WAN-Animate 모듈 연결, trainable boundary, frozen encoder cache.
+
+실행 위치 / 환경:
+    conda activate elite
+    cd /media/vilab/mh/curious/lessons/vdm
+
+01 학습 완료 후: 준비된 WAN base + 직접 학습한 disentangler로 학습 대상 확인.
+실제 14B 모델을 GPU에 로드하지만 optimizer 업데이트는 수행하지 않는다.
+    CUDA_VISIBLE_DEVICES=4 python 02_connect_wan.py audit \
+        --disentangler checkpoints/01/best.pt --mode paper
+
+00에서 완성한 data/triplets.jsonl은 042_free_a(train)와 042_free_val(validation).
+각각 77프레임, 9:16 crop이다. --size는 width height 순서다.
+Stage1 학습에 사용할 VAE/CLIP cache:
+    CUDA_VISIBLE_DEVICES=4 python 02_connect_wan.py cache \
+        --manifest data/triplets.jsonl --size 288 512 --out data/cache_stage1
+
+Stage1을 끝내고 Stage2로 갈 때 같은 입력으로 고해상도 cache 생성:
+    CUDA_VISIBLE_DEVICES=4 python 02_connect_wan.py cache \
+        --manifest data/triplets.jsonl --size 576 1024 --out data/cache_stage2
+
+출력: data/cache_stage1/ 또는 data/cache_stage2/의 index.json과 clip별 .pt.
+이미 index.json이 있는 cache는 덮어쓰지 않으므로 새 --out을 지정한다.
+index.json이 이미 있으면 해당 cache로 03을 진행한다.
+Cache 생성은 disentangler를 거치지 않고 raw code를 보존한다.
+공개 모델만 별도로 확인할 때는 audit의 --disentangler를
+weights/xnemo_disentangler.pt로 명시적으로 바꾼다. 이것은 01 학습 완료를 뜻하지 않는다.
+도움말: python 02_connect_wan.py cache --help
 
 읽는 순서: build_pipeline -> parameter_groups -> encode_triplet.
 14B DiT를 작은 대체 네트워크로 바꾸지 않는다. frozen DiT도 backward graph에
@@ -53,6 +80,10 @@ def build_pipeline(disentangler, adapter=None, device="cuda"):
     translator의 merged MLP 초기화 recipe는 미공개이므로 PyTorch 초기화 사용.
     --adapter: 공개 또는 우리 adapter 가중치로 명시적 warm start.
     """
+    if not Path(disentangler).is_file():
+        raise FileNotFoundError(f"disentangler가 없습니다: {disentangler}. 01 train 완료 후 best.pt를 지정하세요")
+    if adapter and not Path(adapter).is_file():
+        raise FileNotFoundError(f"adapter가 없습니다: {adapter}. 03 학습 결과 또는 공개 checkpoint를 지정하세요")
     pipe=base_pipeline(device)
     from vda.third_party.diffsynth.models.wan_video_animate_adapter_xnemo import WanAnimateAdapterXNemo, build_translator_head
     ad=pipe.animate_adapter
@@ -184,13 +215,18 @@ def cache_manifest(args):
         "weak_identity_blur":config()["training"]["implementation_choices"]["weak_identity_blur"]},indent=2))
 
 
-def main():
-    p=argparse.ArgumentParser(description=__doc__); s=p.add_subparsers(dest="stage",required=True)
+def build_parser():
+    p=argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
+    s=p.add_subparsers(dest="stage",required=True)
     a=s.add_parser("cache"); a.add_argument("--manifest",required=True); a.add_argument("--out",required=True)
     a.add_argument("--size",type=int,nargs=2,default=[288,512],metavar=("W","H")); a.add_argument("--device",default="cuda")
     a=s.add_parser("audit"); a.add_argument("--disentangler",required=True); a.add_argument("--adapter")
     a.add_argument("--device",default="cuda"); a.add_argument("--mode",choices=["paper","release"],default="paper")
-    a=p.parse_args()
+    return p
+
+
+def main():
+    a=build_parser().parse_args()
     if a.stage=="cache": cache_manifest(a)
     else:
         pipe=build_pipeline(a.disentangler,a.adapter,a.device)

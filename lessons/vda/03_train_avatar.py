@@ -1,4 +1,50 @@
-"""03 — camera-triplet rectified flow fine-tuning (Eq.5, Table7).
+r"""03 — camera-triplet rectified flow fine-tuning (Eq.5, Table7).
+
+실행 위치 / 환경:
+    conda activate elite
+    cd /media/vilab/mh/curious/lessons/vdm
+
+준비물: 01의 checkpoints/01/best.pt + 02의 stage별 cache/index.json.
+아래 명령들은 모두 직접 학습한 01 checkpoint를 사용한다.
+042 한 사람 학습이며 validation은 같은 사람의 다른 시간 구간이다.
+
+1. Stage1: 288x512, 77프레임, 기본 5000 steps:
+    CUDA_VISIBLE_DEVICES=4 python 03_train_avatar.py \
+        --cache data/cache_stage1 --disentangler checkpoints/01/best.pt \
+        --out checkpoints/03_stage1 --val-every 100
+
+2. Stage1 학습 재개 (optimizer/RNG 포함; 같은 data/config/source 필요):
+    CUDA_VISIBLE_DEVICES=4 python 03_train_avatar.py \
+        --cache data/cache_stage1 --disentangler checkpoints/01/best.pt \
+        --out checkpoints/03_stage1 --val-every 100 \
+        --resume checkpoints/03_stage1/latest.pt
+
+3. Stage2: 먼저 02에서 data/cache_stage2 생성. stage1 best에서 시작, 기본 250 steps:
+    CUDA_VISIBLE_DEVICES=4 python 03_train_avatar.py --stage 2 \
+        --cache data/cache_stage2 --disentangler checkpoints/01/best.pt \
+        --adapter checkpoints/03_stage1/best.pt \
+        --out checkpoints/03_stage2 --val-every 100
+4. Stage2 재개 (--adapter 없이 optimizer/RNG까지 복원):
+    CUDA_VISIBLE_DEVICES=4 python 03_train_avatar.py --stage 2 \
+        --cache data/cache_stage2 --disentangler checkpoints/01/best.pt \
+        --resume checkpoints/03_stage2/latest.pt \
+        --out checkpoints/03_stage2 --val-every 100
+
+짧은 실행 확인용 (실제 데이터 cache 필요; 본 학습과 별도 출력 폴더 사용):
+    CUDA_VISIBLE_DEVICES=4 python 03_train_avatar.py \
+        --cache data/cache_stage1 --disentangler checkpoints/01/best.pt \
+        --steps 2 --val-every 1 --no-val-render --out checkpoints/03_quickcheck
+
+출력: --out 아래 best.pt/latest.pt, training.jsonl, validation/metrics.jsonl,
+validation/0.jpg,100.jpg,... (마지막 step도 저장).
+--no-val-render는 생성 JPG만 생략하며 고정 flow validation은 수행한다.
+--steps는 재개 시에도 누적 목표 step 수다. --adapter는 가중치만 초기화하는
+warm start이고 --resume과 함께 쓸 수 없다. 기본 --mode paper는 expression
+head도 학습한다. 비교용 --mode release는 이 head를 고정한다.
+01의 --protocol single-subject는 데이터 검증 설정이고, 여기 --mode paper는
+학습할 parameter 선택이므로 함께 사용해도 된다. 서로 다른 설정이다.
+다음 04에서는 data/triplets/042_free_val과 이 단계의 best.pt를 사용한다.
+도움말: python 03_train_avatar.py --help
 
 x_sigma=(1-sigma)*x0+sigma*noise; velocity=noise-x0.
 reference는 별도 latent slot0이고 loss에서 제외한다. 77 target frames ->20 slots.
@@ -123,7 +169,10 @@ def validate(pipe,blob,step,out,seed=1234,render=True):
 
 def train(args):
     cfg=config(); settings=cfg["training"]; seed_all(cfg["seed"])
-    cache=Path(args.cache); index=json.loads((cache/"index.json").read_text())
+    cache=Path(args.cache)
+    if not (cache/"index.json").is_file():
+        raise FileNotFoundError(f"{cache/'index.json'} 없음. 02 cache로 stage{args.stage} 입력을 먼저 준비하세요")
+    index=json.loads((cache/"index.json").read_text())
     if index["upstream"]!=COMMIT: raise ValueError("upstream mismatch")
     if index["weak_identity_blur"]!=settings["implementation_choices"]["weak_identity_blur"]:
         raise ValueError("weak reference preprocessing mismatch: cache를 다시 준비하세요")
@@ -185,15 +234,20 @@ def train(args):
             if improved: save(out/"best.pt",ck)
 
 
-def main():
-    p=argparse.ArgumentParser(description=__doc__)
+def build_parser():
+    p=argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--cache",required=True); p.add_argument("--disentangler",required=True)
     p.add_argument("--out",default=str(ROOT/"checkpoints/03_stage1")); p.add_argument("--device",default="cuda")
     p.add_argument("--stage",type=int,choices=[1,2],default=1); p.add_argument("--mode",choices=["paper","release"],default="paper")
     p.add_argument("--steps",type=int); p.add_argument("--resume"); p.add_argument("--adapter")
     p.add_argument("--val-every",type=int,default=100); p.add_argument("--no-val-render",action="store_true")
-    a=p.parse_args()
+    return p
+
+
+def main():
+    p=build_parser(); a=p.parse_args()
     if a.val_every<=0: p.error("val-every > 0")
+    if a.steps is not None and a.steps<1: p.error("steps >= 1")
     train(a)
 
 
