@@ -9,6 +9,7 @@ __pycache__/
 /assets/flame/*
 
 # 로컬 설정/비밀 값과 OS 임시 파일
+/.private/
 .env
 .env.*
 !.env.example
