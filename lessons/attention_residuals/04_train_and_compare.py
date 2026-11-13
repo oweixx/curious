@@ -48,7 +48,7 @@ def device_of(name):
 @torch.no_grad()
 def evaluate(model, batch, device, two_phase=False):
     model.eval()
-    keys, colors, target = batch
+    keys = batch[0]
     total_loss, correct = 0., 0
     for start in range(0, len(keys), 128):
         k, c, y = [x[start:start+128].to(device) for x in batch]
@@ -58,15 +58,17 @@ def evaluate(model, batch, device, two_phase=False):
     return dict(loss=total_loss / len(keys), accuracy=correct / len(keys))
 
 
-def inspect(model, batch, device, path, history, step, two_phase=False):
-    """고정 16개 예제로 forward/backward를 관찰한다. optimizer step은 하지 않는다."""
+def inspect(model, batch, device, path, history, step, two_phase=False, gradients=True):
+    """고정 예제를 관찰한다. train 검증에만 gradient probe를 쓰며 추론은 no_grad다."""
     model.eval()
     model.zero_grad(set_to_none=True)
     keys, colors, target = [x[:16].to(device) for x in batch]
-    logits, trace = model(keys, colors, capture=True, two_phase=two_phase)
-    F.cross_entropy(logits, target).backward()
+    with torch.enable_grad() if gradients else torch.no_grad():
+        logits, trace = model(keys, colors, capture=True, two_phase=two_phase)
+        if gradients:
+            F.cross_entropy(logits, target).backward()
     input_rms = [rms(x) for x in trace["inputs"]]
-    gradient_rms = [rms(x.grad) if x.grad is not None else 0. for x in trace["inputs"]]
+    gradient_rms = [rms(x.grad) if x.grad is not None else 0. for x in trace["inputs"]] if gradients else []
     branch_rms = [rms(x) for x in trace["outputs"]]
     fig = plt.figure(figsize=(15, 9))
     grid = fig.add_gridspec(2, 3)
@@ -103,9 +105,10 @@ def inspect(model, batch, device, path, history, step, two_phase=False):
     ax.plot(branch_rms, "s-", label="branch output RMS")
     ax.set(xlabel="ATTN / MLP sublayer", ylabel="activation RMS", title="Same probe batch / loss reduction")
     ax.legend(fontsize=7, loc="upper left")
-    grad_axis = ax.twinx()
-    grad_axis.plot(gradient_rms, "r.--", label="input gradient RMS")
-    grad_axis.set_ylabel("input gradient RMS", color="r")
+    if gradients:
+        grad_axis = ax.twinx()
+        grad_axis.plot(gradient_rms, "r.--", label="input gradient RMS")
+        grad_axis.set_ylabel("input gradient RMS", color="r")
     fig.suptitle(f"{model.config.variant} | step {step} | task: synthetic key-color recall", fontsize=14)
     savefig(fig, path)
     model.zero_grad(set_to_none=True)
@@ -230,7 +233,7 @@ def infer(a):
     test = recall_batch(2048, model.config.pairs, torch.Generator().manual_seed(seed))
     metrics = evaluate(model, test, device, a.two_phase)
     folder = a.out or a.checkpoint.parent / "inference"
-    diagnostics = inspect(model, test, device, folder / "predictions.png", saved["history"], saved["step"], a.two_phase)
+    diagnostics = inspect(model, test, device, folder / "predictions.png", saved["history"], saved["step"], a.two_phase, gradients=False)
     write_json(folder / "metrics.json", dict(checkpoint=str(a.checkpoint.resolve()), step=saved["step"], test_seed=seed, examples=2048, two_phase=a.two_phase, **metrics, **diagnostics))
     print(f"{model.config.variant}: unseen recall accuracy={metrics['accuracy']:.2%}, CE={metrics['loss']:.4f} -> {folder}")
 
@@ -263,7 +266,8 @@ def main():
     comparison.add_argument("--out", type=Path, default=ROOT / "outputs/04")
     comparison.add_argument("--variants", nargs="+", choices=VARIANTS, default=list(VARIANTS[:3]))
     a = p.parse_args()
-    setup(getattr(a, "seed", None) or 42)
+    seed = getattr(a, "seed", None)
+    setup(42 if seed is None else seed)
     try:
         if a.stage == "train":
             if min(a.steps, a.eval_every, a.batch_size, a.lr) <= 0:

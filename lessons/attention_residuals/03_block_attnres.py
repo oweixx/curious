@@ -12,6 +12,7 @@ source_cache 그림은 저장할 표현 수이며 전체 학습 VRAM이나 측�
 """
 
 from dataclasses import replace
+from pathlib import Path
 import copy
 import math
 import torch
@@ -39,7 +40,7 @@ def compare(left, right, keys, colors, right_two_phase=False):
 
 def main():
     p = parser(__doc__)
-    p.add_argument("--out", type=type(ROOT), default=ROOT / "outputs/03")
+    p.add_argument("--out", type=Path, default=ROOT / "outputs/03")
     a = p.parse_args()
     setup()
     config = Config(variant="full", depth=3, dim=16, heads=2, pairs=4)
@@ -67,7 +68,7 @@ def main():
         groups = [sources[0]] + [sources[i:i+size].sum(0) for i in range(1, 13, size)]
         _, w = mixer(groups)
         expanded = torch.cat((w[:1, 0, 0], w[1:, 0, 0].repeat_interleave(size)))
-        heatmap(axis, expanded.detach()[None], f"Source coefficient; block_size={size}", "embedding, ATTN0, MLP0, ...", "final output")
+        heatmap(axis, expanded.detach()[None], f"Source coefficient; block_size={size}", "embedding, ATTN0, MLP0, ...", "final output", vmin=0, vmax=1)
     savefig(fig, a.out / "grouping.png")
     depths = list(range(4, 129, 4))
     fig, ax = plt.subplots(figsize=(8, 3.5))

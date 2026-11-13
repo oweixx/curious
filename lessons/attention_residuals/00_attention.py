@@ -12,6 +12,7 @@ r"""00 — attention은 '어디에서 읽을지'와 '무엇을 읽을지'를 분
 """
 
 import math
+from pathlib import Path
 import torch
 from torch.nn import functional as F
 from common import ROOT, parser, setup, plt, heatmap, savefig, write_json
@@ -20,7 +21,7 @@ from models import TokenAttention
 
 def main():
     p = parser(__doc__)
-    p.add_argument("--out", type=type(ROOT), default=ROOT / "outputs/00")
+    p.add_argument("--out", type=Path, default=ROOT / "outputs/00")
     a = p.parse_args()
     setup()
 

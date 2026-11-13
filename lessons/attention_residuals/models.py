@@ -39,7 +39,8 @@ class TokenAttention(nn.Module):
 
     def forward(self, x):
         b, t, d = x.shape
-        q, k, v = self.qkv(x).reshape(b, t, 3, self.heads, d // self.heads).permute(2, 0, 3, 1, 4).unbind(0)
+        qkv = self.qkv(x).reshape(b, t, 3, self.heads, d // self.heads)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
         scores = (q @ k.transpose(-2, -1)) / math.sqrt(d // self.heads)
         mask = torch.ones(t, t, device=x.device, dtype=torch.bool).tril()
         weights = scores.masked_fill(~mask, -torch.inf).softmax(dim=-1)
@@ -59,7 +60,9 @@ class DepthAttention(nn.Module):
         super().__init__()
         self.query = nn.Parameter(torch.zeros(dim))  # 논문 §5: 반드시 zero-init.
         self.norm = RMSNorm(dim) if key_norm else nn.Identity()
-        self.static_logits = nn.Parameter(torch.zeros(static_sources)) if static_sources else None
+        self.static_logits = (
+            nn.Parameter(torch.zeros(static_sources)) if static_sources else None
+        )
         if static_sources:
             self.query.requires_grad_(False)
             self.norm.requires_grad_(False)
@@ -104,7 +107,9 @@ def merge_partial(mixer, inter_output, inter_lse, partial):
         return inter_output
     partial_score = mixer.scores(partial.unsqueeze(0))[0]
     total_lse = torch.logaddexp(inter_lse, partial_score)
-    return (inter_lse - total_lse).exp()[..., None] * inter_output + (partial_score - total_lse).exp()[..., None] * partial
+    inter_weight = (inter_lse - total_lse).exp()[..., None]
+    partial_weight = (partial_score - total_lse).exp()[..., None]
+    return inter_weight * inter_output + partial_weight * partial
 
 
 class Sublayer(nn.Module):
@@ -112,7 +117,12 @@ class Sublayer(nn.Module):
         super().__init__()
         self.norm = RMSNorm(dim)
         self.is_attention = is_attention
-        self.fn = TokenAttention(dim, heads) if is_attention else nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))
+        if is_attention:
+            self.fn = TokenAttention(dim, heads)
+        else:
+            self.fn = nn.Sequential(
+                nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim)
+            )
 
     def forward(self, x):
         if self.is_attention:
@@ -147,13 +157,21 @@ class RecallTransformer(nn.Module):
         self.key_embed = nn.Embedding(c.pairs, c.dim)
         self.color_embed = nn.Embedding(9, c.dim)
         self.position = nn.Parameter(torch.randn(1, c.pairs + 1, c.dim) * .02)
-        self.layers = nn.ModuleList([Sublayer(c.dim, c.heads, i % 2 == 0) for i in range(2 * c.depth)])
+        self.layers = nn.ModuleList(
+            [Sublayer(c.dim, c.heads, i % 2 == 0) for i in range(2 * c.depth)]
+        )
         self.final_norm = RMSNorm(c.dim)
         self.classifier = nn.Linear(c.dim, 8)
         # 마지막 출력 head 앞에도 별도의 AttnRes가 있다 (논문 Eq.6 뒤 문단).
         self.mixers = nn.ModuleList()
         if c.variant != "baseline":
-            self.mixers.extend(DepthAttention(c.dim, key_norm=c.variant != "no_key_norm", static_sources=2 * c.depth + 1 if c.variant == "static" else None) for _ in range(2 * c.depth + 1))
+            for _ in range(2 * c.depth + 1):
+                mixer = DepthAttention(
+                    c.dim,
+                    key_norm=c.variant != "no_key_norm",
+                    static_sources=2 * c.depth + 1 if c.variant == "static" else None,
+                )
+                self.mixers.append(mixer)
 
     def forward(self, keys, colors, capture=False, two_phase=False):
         c = self.config
@@ -162,7 +180,7 @@ class RecallTransformer(nn.Module):
         embedding = self.key_embed(keys) + self.color_embed(colors) + self.position
         hidden = embedding
         completed, partial = [embedding], None
-        trace = {"depth_weights": [], "source_names": [], "token_weights": [], "inputs": [], "outputs": []}
+        trace = {"depth_weights": [], "token_weights": [], "inputs": [], "outputs": []}
         block_size = c.block_size if c.variant == "block" else 1
         inter_outputs = inter_lses = None
         for i, layer in enumerate(self.layers):
@@ -172,8 +190,15 @@ class RecallTransformer(nn.Module):
                 if two_phase:
                     if i % block_size == 0:
                         end = min(i + block_size, len(self.layers))
-                        inter_outputs, inter_lses = prepare_inter_block(self.mixers[i:end], completed)
-                    hidden = merge_partial(self.mixers[i], inter_outputs[i % block_size], inter_lses[i % block_size], partial)
+                        inter_outputs, inter_lses = prepare_inter_block(
+                            self.mixers[i:end], completed
+                        )
+                    hidden = merge_partial(
+                        self.mixers[i],
+                        inter_outputs[i % block_size],
+                        inter_lses[i % block_size],
+                        partial,
+                    )
                     if capture:
                         _, weights = self.mixers[i](sources)
                 else:
@@ -197,7 +222,6 @@ class RecallTransformer(nn.Module):
                     branch.retain_grad()
                 if weights is not None:
                     trace["depth_weights"].append(weights.detach())
-                    trace["source_names"].append(["embed"] + [f"s{j}" for j in range(1, weights.shape[0])])
                 if token_weights is not None:
                     trace["token_weights"].append(token_weights.detach())
         if c.variant != "baseline":

@@ -10,13 +10,14 @@ r"""01 — residual을 펼쳐 보면 '이전 출력들을 모두 계수 1로 더
       RMSNorm이 각 branch 입력을 정규화해도 residual stream 자체가 정규화되는가?
 """
 
+from pathlib import Path
 import torch
 from common import ROOT, parser, setup, plt, savefig, write_json, heatmap
 
 
 def main():
     p = parser(__doc__)
-    p.add_argument("--out", type=type(ROOT), default=ROOT / "outputs/01")
+    p.add_argument("--out", type=Path, default=ROOT / "outputs/01")
     a = p.parse_args()
     setup()
     outputs = torch.randn(65, 256, 64, dtype=torch.float64)

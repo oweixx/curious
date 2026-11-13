@@ -7,11 +7,12 @@ r"""02 — token축에서 depth축으로: learned pseudo-query가 이전 출력�
 결과: outputs/02/selection.png, learning.png, key_normalization.png, checks.json
 이 파일에서는 backbone을 고정된 인공 source로 대신하고 AttnRes selector만 학습한다.
 04는 token attention/MLP/embedding/selector를 모두 학습한다.
-source[0] feature에 양의 marker를 가진 항목을 찾는 인공 과제로, 실제 layer 역할의 발견은 아니다.
+각 source의 0번 feature에 양의 marker가 있는 항목을 찾는 인공 과제다. 실제 layer 역할의 발견은 아니다.
 질문: query는 입력에 무관한 Parameter인데 왜 attention weight는 입력마다 달라질까?
       key RMSNorm이 value의 크기까지 정규화하는가?
 """
 
+from pathlib import Path
 import torch
 from tqdm.auto import trange
 from common import ROOT, parser, setup, plt, heatmap, savefig, write_json
@@ -31,7 +32,7 @@ def examples(batch, generator):
 def main():
     p = parser(__doc__)
     p.add_argument("--steps", type=int, default=200)
-    p.add_argument("--out", type=type(ROOT), default=ROOT / "outputs/02")
+    p.add_argument("--out", type=Path, default=ROOT / "outputs/02")
     a = p.parse_args()
     if a.steps < 1:
         p.error("steps는 양수여야 합니다.")
@@ -69,21 +70,29 @@ def main():
     ax[1].bar(range(16), mixer.query.detach()); ax[1].set(xlabel="feature", title="Learned pseudo-query (shared over tokens)")
     savefig(fig, a.out / "learning.png")
 
-    # key norm은 scale 편향을 막지만 value를 변환하지 않는다.
-    scaled = fixed.clone(); scaled[1] *= 20
+    # 별도의 고정 숫자 실험: 내용의 방향은 같고 source 1의 크기만20배 바꾼다.
+    # 학습된 selector의 성능 비교가 아니라 key norm의 효과를 분리한 계산이다.
+    probe = DepthAttention(4)
     with torch.no_grad():
-        scaled_output, scaled_weights = mixer(list(scaled))
-        raw_logits = torch.einsum("d,sbtd->sbt", mixer.query, fixed)
-        raw_scaled = torch.einsum("d,sbtd->sbt", mixer.query, scaled)
-    alpha_error = (weights - scaled_weights).abs().max().item()
+        probe.query.copy_(torch.tensor([1., 0., 0., 0.]))
+        original = torch.tensor([[1., 0., 0., 0.], [.5, 1., 0., 0.], [.2, 0., 1., 0.], [-.2, 0., 0., 1.]])[:, None, None]
+        scaled = original.clone(); scaled[1] *= 20
+        original_output, original_weights = probe(list(original))
+        scaled_output, scaled_weights = probe(list(scaled))
+        raw_logits = torch.einsum("d,sbtd->sbt", probe.query, original)
+        raw_scaled = torch.einsum("d,sbtd->sbt", probe.query, scaled)
+    alpha_error = (original_weights - scaled_weights).abs().max().item()
+    raw_alpha_error = (raw_logits.softmax(0) - raw_scaled.softmax(0)).abs().max().item()
     assert alpha_error < 1e-5
+    assert raw_alpha_error > .5
     fig, ax = plt.subplots(1, 2, figsize=(10, 3))
-    for axis, left, right, title in ((ax[0], weights, scaled_weights, "Key RMSNorm"), (ax[1], raw_logits.softmax(0), raw_scaled.softmax(0), "Ablation: raw keys")):
+    for axis, left, right, title in ((ax[0], original_weights, scaled_weights, "Key RMSNorm"), (ax[1], raw_logits.softmax(0), raw_scaled.softmax(0), "Ablation: raw keys")):
         axis.plot(left[:, 0, 0], "o-", label="original")
         axis.plot(right[:, 0, 0], "x--", label="source 1 multiplied by 20")
         axis.set(title=title, xlabel="source", ylabel="weight"); axis.legend(fontsize=8)
+    fig.suptitle("Controlled scale probe: fixed query and source directions")
     savefig(fig, a.out / "key_normalization.png")
-    write_json(a.out / "checks.json", dict(steps=a.steps, selection_accuracy=accuracy, fixed_mse=(output-target).square().mean().item(), initial_mean_error=initial_mean_error, key_scale_alpha_error=alpha_error, value_scale_changes_output=(output-scaled_output).abs().max().item(), trained="DepthAttention only; synthetic marker task"))
+    write_json(a.out / "checks.json", dict(steps=a.steps, selection_accuracy=accuracy, fixed_mse=(output-target).square().mean().item(), initial_mean_error=initial_mean_error, key_scale_alpha_error=alpha_error, raw_key_scale_alpha_error=raw_alpha_error, value_scale_changes_output=(original_output-scaled_output).abs().max().item(), trained="DepthAttention only; synthetic marker task", scale_probe="separate fixed-number experiment"))
     print(f"selector 정확도 {accuracy:.1%} -> {a.out}")
 
 
