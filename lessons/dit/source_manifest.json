@@ -1,0 +1,16 @@
+{
+  "repository": "https://github.com/facebookresearch/DiT",
+  "revision": "ed81ce2229091fd4ecc9a223645f95cf379d582b",
+  "files": {
+    "models.py": "1b8031a1340a3d1045c0bdb382334068f5f20e32edf67b3e6aba961ba91846ca",
+    "LICENSE.txt": "7c6858d0e71dc8b858255270ad4b5004e80b5b058bf5bbc408a28430d6ddbf4b",
+    "diffusion/diffusion_utils.py": "4bc929a713a1136bd96b5d88605f41707bf484fbabe448b0407764eb21502add",
+    "diffusion/__init__.py": "0128da38ee27ab91b78458809f9c50d188d7377b60cc73d3ee777bca8029425d",
+    "diffusion/respace.py": "9dde1492dd9d03e47caa12c7a7293dd7a5af1a79f3ddb0629f1692d97c856903",
+    "diffusion/gaussian_diffusion.py": "d7d095d98ff4666e565d0a854790992e24cc09a4ac75e8eaae9a4ee186a8887b",
+    "diffusion/timestep_sampler.py": "5e7c21f48cf85b91ff0030a9b5f33b74580e56d75004ed310aba9927a4a030ed",
+    "original/train.py": "b58b7632563e1485f465f13245335bc665f3c451e9ed62f89405f52ffe0f7c2a",
+    "original/sample.py": "e82038ecd6d6303208b6a9940705f9c3cd49219f5d76e2caa8d07813d086e2dc",
+    "original/download.py": "f9ea211a0fa8f5ad18e3b3059dbcad38d8e6598a308bc0de744758bcb649a857"
+  }
+}
