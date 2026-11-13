@@ -1,0 +1,29 @@
+{
+  "upstream_commit": "8ba8b8f3e43c98df2e99fe46906cf011b10d34df",
+  "seed": 42,
+  "disentangler": {
+    "embedding_dim": 512, "expr_dim": 512, "cam_dim": 32,
+    "id_dim": 0, "res_dim": 0, "expr_unit_norm": false,
+    "expr_encoder": {"n_layers": 3, "width": 512},
+    "cam_encoder": {"n_layers": 3, "width": 512},
+    "decoder": {"n_layers": 3, "width": 512},
+    "epochs": 1000, "lr": 0.001, "weight_decay": 0.0001,
+    "temperature": 0.07, "expression_batch": [32, 4], "camera_batch": [8, 16],
+    "reconstruction_batch": 64, "cycle_start_epoch": 35,
+    "cycle_weight": 0.1
+  },
+  "training": {
+    "mode": "paper", "stage1_steps": 5000, "stage2_steps": 250,
+    "stage1_size": [288, 512], "stage2_size": [576, 1024],
+    "output_frames": 77, "weight_decay": 0.001, "grad_clip": 1.0,
+    "lr_face_fuser": 0.000005, "lr_face_encoder": 0.00001,
+    "lr_translator": 0.00001, "lr_expression": 0.00001, "lr_pose": 0.00005,
+    "val_every": 100, "save_every": 100,
+    "implementation_choices": {
+      "sigma_sampling": "uniform", "bell_width": 0.25,
+      "expression_dropout": 0.1, "weak_identity_dropout": 0.1,
+      "proxy_dropout": 0.1, "weak_identity_blur": 8.0,
+      "adam_betas": [0.9, 0.999], "validation_seed": 1234
+    }
+  }
+}

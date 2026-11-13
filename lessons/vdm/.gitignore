@@ -1,0 +1,7 @@
+.cache/
+external/
+data/
+weights/
+checkpoints/
+outputs/
+__pycache__/

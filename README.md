@@ -44,6 +44,26 @@
 </div>
 </details>
 
+<details>
+<summary>Video Diffusion Avatars(VDA) (26/11/13 ~ )</summary>
+<div markdown="1">
+
+  - 해당 논문은 기본적으로 지금까지 관심있게 봐왔던 Gaussian Avatar 방법론들과 다르게 Diffusion based Video 형식으로 출력하는 연구이다. explicit한 representation(point-cloud, gs, mesh...)으로 내놓지 않기 때문에 조금은 다른 결이라고 볼 수도 있을 것 같다.
+  - 논문을 읽으면서 헷갈렸던 부분으로는 분명히 3D Mesh model(proxy mesh)을 사용하는 것으로 보아 explicit한 무엇인가가 있는 줄 알았는데 논문에도 잘 명시되어 있듯이 **"the VDM is the avatar"**,**"no 3D asset is ever built"**라고 설명한다. 
+  - 해당 논문의 Contribution & Novelty는 VDM에서 강력한 multi-view consistency를 확보하면서도 입력으로 들어오는 Single Reference에 대해서 일관성을 유지하며 Video Model안에서도 expression, camera view를 분리하여 Avatar를 표현한다는 것이다.
+  - 하지만 실제로 [WAN-Animate-2](https://humanaigc.github.io/wan-animate-2/)를 보자면 똑같이 Single Reference에 대해 입력으로 들어오는 drive video에 대응하는 결과 video를 그대로 출력하는 것을 볼 수 있다. 심지어 Novel-view에 대한 multi-view consistency도 지켜주는 것을 볼 수 있고 더불어 배경또한 일관성있게 잘 처리하는 것을 볼 수 있다. 만약 실제 conference review라면 이렇게 지적할 수 있을까? "WAN-Animate-2에서도 이미 잘되고 있으면서 같은 기능을 똑같이 잘 수행하는 연구가 있는데 이 연구의 독창적인 차별점이 보이지 않는다." 그냥 단순하게 생각하면 이렇게 치부할 수 있을 것이라 생각되기도 한다. 
+
+  - [] Data and proxy model preparation
+  - [] Expression disentanglement
+  - [] Connect wan
+  - [] Train full-pipeline avatar
+  - [] Generate 
+- [Video Diffusion Avatars (arXiv 2026)](https://simongiebenhain.github.io/video-diffusion-avatars/)
+
+</div>
+</details>
+
+
 ---
 ### TODO
 - 3D Reconstruction using 2D Prior
