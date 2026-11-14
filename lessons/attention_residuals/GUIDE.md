@@ -8,6 +8,50 @@
 여기의 실행 가능한 모델과 학습 루프는 수식에 맞춰 작성한 독립적인 교육용 구현이다.
 Kimi Linear의 대규모 LLM 사전학습을 재현한 코드는 아니다. 코드 출처와 범위는 [NOTICE.md](NOTICE.md).
 
+## DiT lesson에서 이어서 시작하기
+
+DiT에서 본 `x = x + gate * F(modulate(norm(x), condition))`를 출발점으로 삼는다.
+gate는 현재 branch의 기여를 조절하지만, 과거 branch들은 이미 하나의 누적 stream에 합쳐져 있다.
+AttnRes의 질문은 **현재 layer가 과거 layer의 개별 출력들을 다시 조회해서,
+현재 입력에 맞는 비율로 섞을 수 있는가?**이다.
+
+이때 depth는 diffusion timestep이 아니라 한 번의 network forward 안에서의 layer 깊이다.
+논문에서는 Attention과 MLP/MoE sublayer를 각각 하나의 layer로 센다.
+DiT의 gate가 이미 조건 의존적이라는 사실과, 논문의 standard residual baseline이
+고정 계수로 더한다는 설명을 구분한다. DiT 전체가 논문의 baseline과 같다는 뜻은 아니다.
+
+DiT를 마친 뒤에는 00에서 Q/K/V와 softmax 축을 복습하고, **01 → 02를 가장 깊게** 본다.
+그다음 03에서 block으로 묶는 이유와 계산을, 04에서 전체 모델의 학습을 확인한다.
+현재 실습은 dense MLP를 쓰며, MoE 구현은 AttnRes 원리를 배우기 위한 선행 조건이 아니다.
+
+### Figure 1의 MoE는 무엇인가?
+
+MoE는 **Mixture of Experts**다. 여기서는 Transformer의 FFN/MLP 자리에
+여러 expert FFN과 학습 가능한 router를 두는 구조로 이해하면 된다.
+일반적인 sparse top-k 예에서는 각 token의 feature로 expert 점수를 계산하고,
+선택된 소수 expert의 출력을 routing weight로 합친다.
+
+```text
+Dense MLP: token → 하나의 공유 MLP → 출력
+Sparse MoE: token → router → 선택된 expert MLP들 → 가중합 → 출력
+```
+
+expert는 각각 다른 파라미터를 가진 신경망이며, 사람이 미리 붙인 '수학 담당',
+'숫자 3 담당' 같은 의미가 자동으로 보장되는 것은 아니다.
+일부 expert만 계산하므로 전체 파라미터 수를 늘리면서 token당 활성 계산량을 제한할 수 있다.
+다만 전체 weight 저장과 routing/통신 비용까지 사라지는 것은 아니다.
+
+| 연산 | 선택하거나 섞는 대상 |
+|---|---|
+| Token attention | 다른 token 위치의 정보 |
+| MoE routing | 현재 token을 처리할 expert FFN |
+| Attention Residuals | 같은 token 위치에 있는 이전 layer/block 출력 |
+
+[논문 Figure 1](https://arxiv.org/pdf/2603.15031)의 (a)/(b)/(c) 모두 Attention과 MoE를 포함한다.
+비교의 중심은 MoE를 새로 넣는 것이 아니라 그 주위의 residual 집계 방식을 바꾸는 것이다.
+이 lesson에서는 같은 위치에 dense MLP를 유지하고 residual 방식만 비교한다.
+MoE 배경: [Sparsely-Gated Mixture-of-Experts](https://arxiv.org/abs/1701.06538).
+
 ## 무엇을 만들고 무엇을 보나?
 
 | 단계 | 중심 질문 | 직접 실행할 결과 | 학습 여부 |

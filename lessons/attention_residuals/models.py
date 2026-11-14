@@ -70,11 +70,15 @@ class DepthAttention(nn.Module):
     def scores(self, values):
         if self.static_logits is not None:
             return self.static_logits[:len(values), None, None].expand(values.shape[:-1])
+        # query [D] x keys [S, B, T, D] -> scores [S, B, T]
+        # feature 별로 곱한 뒤 D축으로 합친다.
         return torch.einsum("d,sbtd->sbt", self.query, self.norm(values))
 
     def forward(self, sources):
         values = torch.stack(sources)
+        # 이전 출력들 사이에서 비율을 정함 source별 weight 점수
         weights = self.scores(values).softmax(dim=0)  # token축이 아닌 source/depth축!
+        # source별 가중치를 곱하고 모든 source를 합산 하여 value를 섞기
         return torch.einsum("sbt,sbtd->btd", weights, values), weights
 
 
