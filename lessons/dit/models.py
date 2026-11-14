@@ -116,6 +116,16 @@ class DiTBlock(nn.Module):
         )
 
     def forward(self, x, c):
+        '''
+        sa, sca, ga, sm, scm, gm = modulation(c)
+        
+        u = norm1(x) * (1 + sca) + sa
+        x = x + ga * attention(u)
+        
+        u = norm2(x) * (1 + scm) + sm
+        x = x + gm * mlp(u)
+        '''
+  
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
@@ -237,9 +247,13 @@ class DiT(nn.Module):
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
+        # embedding input x to latent with position embedding
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
+        # time embedding
         t = self.t_embedder(t)                   # (N, D)
+        # condition embedding
         y = self.y_embedder(y, self.training)    # (N, D)
+        # condition = time + digit
         c = t + y                                # (N, D)
         for block in self.blocks:
             x = block(x, c)                      # (N, T, D)

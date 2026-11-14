@@ -728,6 +728,7 @@ class GaussianDiffusion:
             model_kwargs = {}
         if noise is None:
             noise = th.randn_like(x_start)
+        # 입력 x와 random t, 그리고 random noise를 여기서 sampling해서 섞어준다.
         x_t = self.q_sample(x_start, t, noise=noise)
 
         terms = {}
@@ -744,6 +745,7 @@ class GaussianDiffusion:
             if self.loss_type == LossType.RESCALED_KL:
                 terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
+            # x_t와 t, y가 들어간 상태로 예측을 하게된다.
             model_output = model(x_t, t, **model_kwargs)
 
             if self.model_var_type in [
@@ -776,6 +778,7 @@ class GaussianDiffusion:
                 ModelMeanType.EPSILON: noise,
             }[self.model_mean_type]
             assert model_output.shape == target.shape == x_start.shape
+            # target = noise;
             terms["mse"] = mean_flat((target - model_output) ** 2)
             if "vb" in terms:
                 terms["loss"] = terms["mse"] + terms["vb"]

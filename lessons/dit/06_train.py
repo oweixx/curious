@@ -130,7 +130,7 @@ def main():
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--ema-decay", type=float)
-    p.add_argument("--val-every", type=int, default=100)
+    p.add_argument("--val-every", type=int, default=500)
     p.add_argument("--preview-steps", type=int, default=50)
     p.add_argument("--resume", type=Path)
     p.add_argument("--device", default="cuda")
@@ -204,6 +204,7 @@ def main():
     for step in bar:
         # 1. x는 RGB가 아니라 VAE posterior에서 새로 뽑은 clean latent z_0.
         #    cache는 mean/logvar이고, 여기서는 매번 다른 posterior sample을 쓴다.
+        # sampling 
         ids = torch.randint(len(tr["labels"]), (a.batch_size,))
         x, y = posterior(tr, ids, a.device)
 
@@ -212,6 +213,7 @@ def main():
         #    epsilon 생성 -> q_sample(x,t,epsilon) -> model(z_t,t,y)
         #    -> epsilon MSE + variance VB. 식/gradient는 01과05에서 확인한다.
         #    model.train()이므로 LabelEmbedder가 label의10%를 null로 바꾼다.
+        # landom t를 뽑는다
         t = torch.randint(d.num_timesteps, (len(x),), device=a.device)
         terms = d.training_losses(model, x, t, dict(y=y))
         loss = terms["loss"].mean()

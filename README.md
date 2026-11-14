@@ -62,14 +62,28 @@
 <details>
 <summary>Diffusion Transformer(DiT) (26/11/13 ~ )</summary>
 
-- [ ] study frozen VAE, pixels and latents
-- [ ] Forward diffusion
-- [ ] Patch embedding and token
-- [ ] Attention and conditions
-- [ ] AdaLN-Zero
-- [ ] Optimize objective loss
-- [ ] Optimize train
-- [ ] Reverse diffusion
+- DiT는 간단하게 noise가 섞인 latent를 입력으로 같이 주어진 t와 조건을 통해 해당 noise를 예측하는 형식으로 학습을 진행한다. 여기서 noise를 맞추는 것이 어떻게 이미지 생성으로 이어지는 것인가? 단순 DDPM과 같이 실제 inference의 경우에는 입력으로 들어오는 random noise와 condition에 따라 noise를 예측하여 이미지를 생성하는 형식으로 이루어진다. DDPM과 흐름은 완전히 똑같지만, DDPM에서는 U-Net을 통해 noise를 예측하였다면 DiT는 해당 부분 대신에 Transformer를 이용해 노이즈를 예측하는 것으로 이해할 수 있다. (0, 1)
+- 03_attention_and_condition.py에서 알게된 것은 Condition을 어떤식으로 처리할 것인지에 대한 부분이다. time, y를 embedding을 통해서 하나의 condition으로 표현하여 이를 patchify된 token에 scale, shift 연산을 하게 된다. 여기서 말하는 scale, shift는 단순히 해당 token vector에 값을 곱하고 더하는 형식으로 나타난다. 그렇게 값이 조정된 token은 attention을 통해 값이 계산되게 된다. 여기서 신기한 부분은 condition이 noise 예측 transformer의 영향을 주는 방식이 scale, shift 형식으로 나타난다는 것이다. 이렇게 표현될 수 있기 위해 condition을 embedding하는 MLP와 embedding값들을 이용해 shift와 scale로 변환해주는 Linear의 weight와 bias가 learnable parameter로서 이를 표현하게 해준다. 자연스럽게 이러한 표현을 이용해서 attention에서는 token 사이의 관계에서의 정보를 가져오고, MLP에서 해당 조건들을 반영하여 노이즈를 예측하는 형식으로 진행이 되게 된다. (3,4)
+- 간단하게 정리한 아래 수식을 설명해보도록 하자. Condition c는 입력으로 들어오는 t와 target condition인 y를 각각 embedding을 하고 더해서 들어오는 condition 입력이다. 이를 학습시키는 parameter로는 embedding mlp와 이를 합쳐서 shift, scale, scalar값으로 변환하는 linear parameter가 있다. 왜 굳이 attention과 MLP에 별도의 shift, scale, gate가 있는것인가? 엄연히 두 모듈의 기능이 다르기 때문이다. attention은 동작시 token들의 정보를 주고 받는 형태로 동작하게 되고, MLP는 각 Token 내부의 vector feature들을 변환하는 역할을 가지기 때문이다. 더 쉽게 말하면 어떤 정보를 가지고 있는지 계산하고, 해당 정보를 어떻게 가공할 것인지 변환할 것인지를 하므로 각각 맡은 일이 다르다. 그리고 입력 값을 새로 생성하는 것이 아닌 residual 하게 x + delta(x) 형식으로 더해주는 것은 기존 표현을 유지하면서도 필요한 변화량을 학습하기 위함이다. 더 안정적으로 네트워크를 학습하기 위한 설계라고도 볼 수 있지 않을까 싶다.
+
+        sa, sca, ga, sm, scm, gm = modulation(c)
+        
+        u = norm1(x) * (1 + sca) + sa
+        x = x + ga * attention(u)
+        
+        u = norm2(x) * (1 + scm) + sm
+        x = x + gm * mlp(u)
+        
+
+
+- [x] study frozen VAE, pixels and latents
+- [x] Forward diffusion
+- [x] Patch embedding and token
+- [x] Attention and conditions
+- [x] AdaLN-Zero
+- [x] Optimize objective loss
+- [x] Optimize train
+- [x] Reverse diffusion
 - [ ] CFG
 - [ ] Scaling
 - [ ] Original pretrained XL/2 inference
