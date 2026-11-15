@@ -20,3 +20,6 @@ Thumbs.db
 *~
 *.cache
 # Lesson 파일, 학습용 notebook, 문서의 그림은 Git에 포함한다.
+
+# Research workspace migrated to a separate private repository (local compatibility link).
+/lessons/online_avatar
