@@ -93,15 +93,17 @@
 </details>
 
 <details>
-<summary>Attention Residuals (26/11/14 ~ )</summary>
+<summary>Attention Residuals (26/11/14 ~ 11/14)</summary>
 - 해당 논문은 그냥 추천 받아서 하는거긴한데 논문을 직접 보지 않고 Agent가 만들어준 lesson으로 직접 진행해보면서 배우는 식으로 진행한다.
-- 
+- 완벽히 이해하지는 못했지만, 간단하게.. 내가 이해한대로 간단하게 정리해보자면 기존 self-attention 자체는 입력으로 들어오는 token들 끼리의 정보를 주고 받는 형식으로 값을 측정한다. 반면, 여기 Attention Residuals에서 쓰이는 대표적인 Depth attention 같은 경우에 Transformer L개의 Block의 각 출력에서 나오는 중간 값(?)들을 adaptive하게 이용한다는 점이 특징이다. 기존에는 L개의 Tranasformer block을 통하여 점점 더 깊은 추론과 이해를 할 수 있는 형식이었는데 이러한 과정에서 이전 층 출력들을 저장해 두어 다음 연산의 입력을 만들 때 adaptive하게 weight sum을 하는 형식으로 이루어진다. (2)
+- 이러한 Depth attention 구조를 사용하기 위해 이전의 모든 value 값들을 cache형식처럼 가지고 있는데 효율적으로 사용하기 위해 block_size를 이용해서 해당 cache value들을 묶어주게 된다. 만약 block_size = N 이라고 한다면 해당 value 들을 N개씩 묶어 하나의 가중치로 표현이 되게 되는데 이렇게 되면 효율적이긴 하지만 block value들에 개별적인 weight값을 주지는 못하기 때문에 trade-off가 있는 수준이다. (3)
+
 
 - [x] Basic attention
 - [x] Residaul stream
 - [x] Full AttnRes
-- [ ] Block AttnRes
-- [ ] Train and compare
+- [x] Block AttnRes
+- [x] Train and compare
 
 - [Attention Residuals (Arxiv Mar)](https://arxiv.org/abs/2603.15031)
 
