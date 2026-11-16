@@ -1,0 +1,13 @@
+{
+  "repository": "https://github.com/google-research/pointdit",
+  "revision": "11f53a30aeb4d34d49d2beda655ee6f19b2ad7f8",
+  "original_sha256": {
+    "model.py": "1d8a84a93f0cd280e1b162caeccb3a5704ccacbcf4c2c65ebfae554ec327db3e",
+    "denoiser.py": "bb02dbdc32482840436b2df6132258bd473749637adf32007450fce1eba6097a",
+    "loss.py": "e66f683316c15405a166cefe1fc698937f214084f21a6176f6eaac3174f460fb",
+    "util/model_util.py": "47c1f0214c7295b0577af38b9b1ada1ad1dadfff29a7db83159fdff563a83414",
+    "util/paths.py": "836ffddbfd6bac0b482a4c5951134911b5a01d44f7287dbc70d90441ab7067f6",
+    "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "third_party/THIRD_PARTY_NOTICES": "a3cc489669948c15d2e11578b30f0d9faa074b12f7512a50b8ac44b2b5392c96"
+  }
+}

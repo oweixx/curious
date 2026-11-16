@@ -13,7 +13,7 @@ lesson 폴더:
 읽기: FlowDiT -> image_batch -> training loop 6줄 -> update_ema -> validate.
 실제 MNIST train split을 train/validation으로 나눈다. 공식 test split은 읽지 않는다.
 28px 이미지는 검은 padding으로 32px로 만든다. VAE 없이 pixel space에서 학습한다.
-DiT block/adaLN-Zero는 ../dit/models.py를 직접 재사용한다. 이 모델은 원 DiT checkpoint가 아니다.
+DiT block/adaLN-Zero는 ../done/dit/models.py를 직접 재사용한다. 이 모델은 원 DiT checkpoint가 아니다.
 """
 from contextlib import nullcontext
 from copy import deepcopy
@@ -29,7 +29,7 @@ from common import (ROOT, cpu_state, digest, finish, image_grid, json_file, less
                     parser, pyplot, restore_rng, save, setup, state_rng, step)
 
 L00 = lesson(0)
-DIT_SOURCE = ROOT.parent / "dit/models.py"
+DIT_SOURCE = ROOT.parent / "done/dit/models.py"
 PROFILES = {"mini": dict(width=192, depth=4, heads=6), "smoke": dict(width=64, depth=2, heads=4)}
 
 
@@ -204,7 +204,7 @@ def train(a):
 
 
 def main():
-    shared = ROOT.parent / "dit/data"
+    shared = ROOT.parent / "done/dit/data"
     p = parser(__doc__)
     p.add_argument("--data-root", type=Path, default=shared if (shared / "MNIST/raw/train-images-idx3-ubyte").is_file() else ROOT / "data")
     p.add_argument("--download", action="store_true", help="MNIST가 없을 때 torchvision으로 다운로드")

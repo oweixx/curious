@@ -25,8 +25,8 @@ FM 라이브러리의 `sample()`만 호출하는 wrapper 대신, conditional pat
 03의 Hungarian assignment는 균일 가중치 minibatch의 exact assignment이며 entropic Sinkhorn이나 전역 분포 OT가 아니다.
 Reflow는 작은 2D teacher/student 실험이고 image reflow/distillation은 포함하지 않는다.
 
-04/05는 [../dit/models.py](../dit/models.py)를 직접 재사용한다.
-그 파일의 저작권 헤더, [원본 출처 기록](../dit/NOTICE.md), [CC BY-NC 4.0 라이선스](../dit/LICENSE.txt)를 유지한다.
+04/05는 [../done/dit/models.py](../done/dit/models.py)를 직접 재사용한다.
+그 파일의 저작권 헤더, [원본 출처 기록](../done/dit/NOTICE.md), [CC BY-NC 4.0 라이선스](../done/dit/LICENSE.txt)를 유지한다.
 새 `FlowDiT` wrapper는 1-channel 32px pixels, `learn_sigma=False`, continuous time embedding,
 velocity supervision을 사용한다. pretrained DiT noise weights를 FM checkpoint라고 바꿔 부르지 않는다.
 원본 코드와 현재 로컬 파일의 hash를 image checkpoint에 기록한다.

@@ -7,7 +7,8 @@ __pycache__/
 /FLAME2023/
 /outputs/
 /assets/flame/*
-
+/assets/FLAME2020.zip
+/lessons/data/
 # 로컬 설정/비밀 값과 OS 임시 파일
 /.private/
 .env
